@@ -29,8 +29,39 @@ CORRECTION_HINTS = re.compile(
 )
 # Shell idioms that can make a failed command look successful (a hint, not a verdict).
 ERROR_SWALLOW_HINTS = re.compile(
-    r"\|\|\s*(?:true|:)(?=\s|;|$)|2>\s*/dev/null|&>\s*/dev/null|\|\s*(?:tail|head)\b|\bset\s+\+e\b"
+    r"\|\|\s*(?:true|:)(?=\s|;|$)|2>\s*/dev/null|&>\s*/dev/null|\|\s*(?:tail|head|grep)\b|\bset\s+\+e\b"
 )
+# Commands whose success matters: tests, builds, linters, type checkers.
+CHECK_COMMAND = re.compile(
+    r"\b(?:pytest|py\.test|unittest|tox|nox|jest|vitest|mocha|playwright\s+test|"
+    r"(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|check|typecheck)|"
+    r"go\s+(?:test|build|vet)|cargo\s+(?:test|build|check|clippy)|make\b|"
+    r"ruff|mypy|pyright|eslint|tsc|mvn|gradle)\b"
+)
+# Actions that act on a result: commit, push, publish, deploy, delete, move.
+FOLLOW_UP_ACTION = re.compile(
+    r"&&[^|]*?\b(?:git\s+(?:commit|push|merge|tag)|gh\s+pr\s+(?:create|merge)|"
+    r"(?:npm|pnpm|yarn)\s+publish|twine\s+upload|deploy|vercel|rm\s|mv\s)"
+)
+
+
+def risky_swallow(command):
+    """Return the swallowing idioms only when they can hide a failed check.
+
+    Flags a check command (test, build, lint) combined with an idiom that hides
+    its exit status, either followed by an action that relies on the result or
+    explicitly forced to succeed with `|| true`. Plain `ls | head` and similar
+    output trimming are ignored.
+    """
+    if not CHECK_COMMAND.search(command):
+        return []
+    idioms = [m.strip() for m in ERROR_SWALLOW_HINTS.findall(command)]
+    if not idioms or "pipefail" in command:
+        return []
+    forced = any(i.startswith("||") or i == "set +e" for i in idioms)
+    if FOLLOW_UP_ACTION.search(command) or forced:
+        return list(dict.fromkeys(idioms))
+    return []
 TOKEN_PATTERNS = [
     re.compile(r"\b(?:sk|pk|rk|ghp|gho|github_pat|xox[abp])[-_][A-Za-z0-9_\-]{16,}"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -56,7 +87,40 @@ def clip(text, limit):
     return text[:limit] + f" …〔已截斷，原長 {len(text)} 字〕"
 
 
-def resolve_session(target):
+def session_cwd(path, max_lines=200):
+    """Return the working directory recorded near the start of a session log."""
+    with path.open(encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            if index >= max_lines:
+                break
+            try:
+                cwd = json.loads(line).get("cwd")
+            except json.JSONDecodeError:
+                continue
+            if cwd:
+                return cwd
+    return None
+
+
+def current_session(cwd):
+    """Most recently modified session whose recorded working directory is cwd.
+
+    Claude Code names project folders by replacing every non-alphanumeric
+    character of the path with "-", so the folder name cannot be rebuilt
+    reliably (underscores, dots, spaces, non-ASCII). Match on the recorded cwd.
+    """
+    target = str(Path(cwd).expanduser().resolve())
+    logs = sorted(PROJECTS.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in logs:
+        recorded = session_cwd(path)
+        if recorded and str(Path(recorded).resolve()) == target:
+            return path
+    sys.exit(f"找不到工作目錄是 {target} 的 session。請改給 session ID，或先用 list 查。")
+
+
+def resolve_session(target, cwd=None):
+    if target == "current":
+        return current_session(cwd or Path.cwd())
     path = Path(target).expanduser()
     if path.suffix == ".jsonl" and path.is_file():
         return path
@@ -178,6 +242,7 @@ def digest_one(path, tag, keep_results):
     lines, signals = [], []
     meta = {"cwd": None, "version": None, "permission": set(), "instructions": [], "models": set()}
     turn = 0
+    errors = swallows = loose_swallows = 0
 
     for record in records:
         kind = record.get("type")
@@ -216,11 +281,14 @@ def digest_one(path, tag, keep_results):
                     brief = payload.get("description") or payload.get("command") or payload.get("file_path") or payload.get("prompt") or json.dumps(payload, ensure_ascii=False)
                     lines.append(f"- 🔧 {name}：{clip(redact(str(brief)), TOOL_INPUT_LIMIT)}")
                     command = str(payload.get("command") or "")
-                    swallow = ERROR_SWALLOW_HINTS.findall(command)
-                    if swallow:
-                        found = "、".join(dict.fromkeys(m.strip() for m in swallow))
-                        signals.append(f"- {tag}{when} {name} ⚠ 可能吞掉錯誤的寫法（{found}）：{clip(redact(command), 150)}")
-                        lines.append(f"  - ⚠ 可能吞掉錯誤的寫法：{found}")
+                    if ERROR_SWALLOW_HINTS.search(command):
+                        loose_swallows += 1
+                    risky = risky_swallow(command)
+                    if risky:
+                        swallows += 1
+                        found = "、".join(risky)
+                        signals.append(f"- {tag}{when} {name} ⚠ 檢查結果可能被吞掉（{found}）：{clip(redact(command), 150)}")
+                        lines.append(f"  - ⚠ 檢查結果可能被吞掉：{found}")
             continue
 
         if kind == "user":
@@ -232,13 +300,12 @@ def digest_one(path, tag, keep_results):
                 if block.get("is_error"):
                     denied = "denied" in text.lower() or "rejected" in text.lower() or "拒絕" in text
                     label = "⛔ 被拒絕" if denied else "❌ 錯誤"
+                    errors += 1
                     signals.append(f"- {tag}{when} {name} {label}：{clip(text, 150)}")
                     lines.append(f"  - {label}（{name}）：{clip(text, ERROR_RESULT_LIMIT)}")
                 elif keep_results:
                     lines.append(f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}")
 
-    errors = sum("❌" in s or "⛔" in s for s in signals)
-    swallows = sum("⚠" in s for s in signals)
     header = [
         f"## {tag}Session {path.stem}",
         "",
@@ -246,7 +313,8 @@ def digest_one(path, tag, keep_results):
         f"- 工作目錄：`{meta['cwd']}`",
         f"- Claude Code 版本：{meta['version']}；模型：{', '.join(sorted(m for m in meta['models'] if m))}",
         f"- 權限模式：{', '.join(sorted(p for p in meta['permission'] if p)) or '未記錄'}",
-        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次；可能吞掉錯誤的指令 {swallows} 次",
+        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次；檢查結果可能被吞掉的指令 {swallows} 次",
+        f"- 另有 {loose_swallows} 個指令用了 `| head`、`2>/dev/null` 等寫法，多半只是縮短輸出，未逐一列出；診斷時可視需要 grep 原始紀錄",
     ]
     header += [f"- 載入的指示檔（系統紀錄）：{item}" for item in meta["instructions"]]
     subagent_logs = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
@@ -257,7 +325,7 @@ def digest_one(path, tag, keep_results):
 
 
 def cmd_digest(args):
-    paths = list(dict.fromkeys(resolve_session(t) for t in args.targets))
+    paths = list(dict.fromkeys(resolve_session(t, args.cwd) for t in args.targets))
     paths.sort(key=first_timestamp)
     multi = len(paths) > 1
     headers, bodies, all_signals, total_turns = [], [], [], 0
@@ -291,9 +359,10 @@ def main():
     p_list.add_argument("--project", help="只看專案名稱含這個關鍵字的資料夾（例如 my-app），或直接給資料夾路徑")
     p_list.add_argument("--limit", type=int, default=15)
     p_digest = sub.add_parser("digest", help="把一個或多個 session 壓成一份摘要")
-    p_digest.add_argument("targets", nargs="+", help="session ID（可只給前幾碼）或 .jsonl 路徑；可給多個")
+    p_digest.add_argument("targets", nargs="+", help="session ID（可只給前幾碼）、.jsonl 路徑，或 current；可給多個")
     p_digest.add_argument("--out", required=True, help="摘要輸出路徑")
     p_digest.add_argument("--results", action="store_true", help="也保留成功的工具結果（摘要會變大）")
+    p_digest.add_argument("--cwd", help="搭配 current 使用：指定工作目錄（預設為目前所在資料夾）")
     args = parser.parse_args()
     {"list": cmd_list, "digest": cmd_digest}[args.command](args)
 
