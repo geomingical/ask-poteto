@@ -10,8 +10,8 @@ digest in chronological order, tagged S1, S2, ...
 
 The digest keeps every typed user message and assistant reply in full, shortens
 tool calls and results, and marks signals worth a diagnostician's attention:
-tool errors, interruptions, denied tool calls, and user turns that look like
-corrections. The signals are hints for where to look, not verdicts.
+tool errors, interruptions, denied tool calls, user turns that look like
+corrections, and shell commands written in a way that can hide a failure. The signals are hints for where to look, not verdicts.
 """
 import argparse
 import json
@@ -26,6 +26,10 @@ CORRECTION_HINTS = re.compile(
     r"不對|不是|錯了|有錯|為什麼|又|不要|別再|我說|重做|重來|改回|看清楚|沒有照|不行|"
     r"\bno\b|\bnot\b|wrong|stop|don'?t|again|instead|why did|i said|revert|undo",
     re.IGNORECASE,
+)
+# Shell idioms that can make a failed command look successful (a hint, not a verdict).
+ERROR_SWALLOW_HINTS = re.compile(
+    r"\|\|\s*(?:true|:)(?=\s|;|$)|2>\s*/dev/null|&>\s*/dev/null|\|\s*(?:tail|head)\b|\bset\s+\+e\b"
 )
 TOKEN_PATTERNS = [
     re.compile(r"\b(?:sk|pk|rk|ghp|gho|github_pat|xox[abp])[-_][A-Za-z0-9_\-]{16,}"),
@@ -211,6 +215,12 @@ def digest_one(path, tag, keep_results):
                     payload = block.get("input") or {}
                     brief = payload.get("description") or payload.get("command") or payload.get("file_path") or payload.get("prompt") or json.dumps(payload, ensure_ascii=False)
                     lines.append(f"- 🔧 {name}：{clip(redact(str(brief)), TOOL_INPUT_LIMIT)}")
+                    command = str(payload.get("command") or "")
+                    swallow = ERROR_SWALLOW_HINTS.findall(command)
+                    if swallow:
+                        found = "、".join(dict.fromkeys(m.strip() for m in swallow))
+                        signals.append(f"- {tag}{when} {name} ⚠ 可能吞掉錯誤的寫法（{found}）：{clip(redact(command), 150)}")
+                        lines.append(f"  - ⚠ 可能吞掉錯誤的寫法：{found}")
             continue
 
         if kind == "user":
@@ -228,6 +238,7 @@ def digest_one(path, tag, keep_results):
                     lines.append(f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}")
 
     errors = sum("❌" in s or "⛔" in s for s in signals)
+    swallows = sum("⚠" in s for s in signals)
     header = [
         f"## {tag}Session {path.stem}",
         "",
@@ -235,7 +246,7 @@ def digest_one(path, tag, keep_results):
         f"- 工作目錄：`{meta['cwd']}`",
         f"- Claude Code 版本：{meta['version']}；模型：{', '.join(sorted(m for m in meta['models'] if m))}",
         f"- 權限模式：{', '.join(sorted(p for p in meta['permission'] if p)) or '未記錄'}",
-        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次",
+        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次；可能吞掉錯誤的指令 {swallows} 次",
     ]
     header += [f"- 載入的指示檔（系統紀錄）：{item}" for item in meta["instructions"]]
     subagent_logs = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))

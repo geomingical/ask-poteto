@@ -4,13 +4,22 @@
 
 A [Claude Code](https://claude.com/claude-code) skill that works out **where a conversation went wrong**, and what to build so it doesn't happen again.
 
-Give it one session, or several sessions that continue the same piece of work. It reads the full log, including your messages and every tool call. Each time you had to correct Claude, or Claude got something wrong, it asks: *which layer should have caught this?*
+Give it one session, or several sessions that continue the same piece of work. It reads the full log, including your messages and every tool call. Each time you had to **correct or step in** for Claude, it asks: *which layer should have caught this?*
 
 1. **Codebase**: the project's code, file structure, existing examples
 2. **Automated checks**: tests, linters, hooks, `settings.json` permissions
 3. **Rules**: `CLAUDE.md`, `~/.claude/rules/`, memory files
 4. **Skills**: `~/.claude/skills/`, project skills, plugin skills
 5. **Human correction**: you reminding Claude in the chat. This should be the last resort.
+
+It also looks for **silent failures**. No correction doesn't mean nothing went wrong. It may just mean nobody checked. So whether or not you corrected anything, it looks for:
+
+- Claude saying "done", "tests pass" or "verified" with no evidence anywhere in the conversation
+- commands that can hide a failure, like `|| true`, `2>/dev/null`, or `| tail`
+- data that was filtered or deleted without a before/after count
+- steps you asked for that were quietly skipped or cut short
+
+When it finds one, it searches the rest of the log for the same pattern. The one that got noticed is often not the only one. A clean report says either "checked, no problems found" or "nobody corrected anything, but N claims have no evidence". It never just says "fine".
 
 Next it checks the project against three pillars of trust:
 
@@ -22,6 +31,7 @@ Each suggestion says **whether it belongs in your global config or in one projec
 
 > **Credit and disclaimer**
 > The "which layer to fix first" framework and the three pillars come from a talk by **poteto (Lauren Tan)**: <https://x.com/poteto/status/2102050467505430555>.
+> Starting from the moment you correct or step in for the agent is her framing. The extra signals (Claude backtracking, tool errors, unverified claims) and the whole silent-failure check are this skill's own additions.
 > This is an **unofficial** adaptation. It is **not affiliated with or endorsed by** Lauren Tan, and any errors in how the ideas are interpreted are mine. Please refer to the original talk.
 
 ## Language
@@ -67,7 +77,7 @@ You can also just ask in plain language, for example "diagnose that session", "w
 
 What happens:
 
-1. The bundled script condenses the session log into a text-only digest in a temporary folder. It keeps the full conversation, shortens tool calls, drops images, and masks things that look like API keys.
+1. The bundled script condenses the session log into a text-only digest in a temporary folder. It keeps the full conversation, shortens tool calls, drops images, masks things that look like API keys, and flags commands that can hide a failure.
 2. Claude lists which instruction files were in effect, sorted into global and project-level.
 3. A read-only subagent (a helper Claude with a clean context window) reads the digest against [`references/rubric.md`](references/rubric.md) and writes the diagnosis.
 4. The main Claude spot-checks the quoted evidence, rewrites the report for you, and deletes the temporary digest.
@@ -90,7 +100,7 @@ python3 scripts/condense_session.py digest <session-id> [<more-ids> ...] --out /
 ## Limitations
 
 - Claude Code's session log format (`.jsonl`) is not a documented public format and may change between versions. If the digest comes out empty or incomplete, please open an issue.
-- The "possible correction" markers are just keyword matches. They miss real corrections and flag ordinary questions.
+- The "possible correction" and "may hide a failure" markers are just pattern matches. They miss real problems and flag harmless ones. For example, `| head` used only to shorten output gets flagged.
 - A single session is a small sample. The skill labels suggestions based on one session as low confidence.
 
 ## File structure
