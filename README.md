@@ -29,11 +29,13 @@ Next it checks the project against three pillars of trust:
 - **Quality skills**: does it work the way you expect, not just produce the right result?
 - **Agent-friendly structure**: does the project make the right thing the default?
 
+Finally it checks **goal alignment**: does the agent know where the work is supposed to go? It looks for where the project goal is written and who wrote it (you, an imported handoff, or the agent itself), whether it matches what you actually say you want, who set the current priority, and whether there is a way to see how far the work is from done. A project can do every task correctly and still drift if the agent is choosing the direction. Fixing errors doesn't help much if the work is pointed the wrong way.
+
 Each suggestion says **whether it belongs in your global config or in one project**. Global config affects every project you have, so the skill puts suggestions in the project by default.
 
 > **Credit and disclaimer**
 > The "which layer to fix first" framework and the three pillars come from a talk by **poteto (Lauren Tan)**: <https://x.com/poteto/status/2102050467505430555>.
-> Starting from the moment you correct or step in for the agent is her framing. The extra signals (Claude backtracking, tool errors, unverified claims) and the whole silent-failure check are this skill's own additions.
+> Starting from the moment you correct or step in for the agent is her framing. The extra signals (Claude backtracking, tool errors, unverified claims) the whole silent-failure check, and the goal-alignment check are this skill's own additions.
 > This is an **unofficial** adaptation. It is **not affiliated with or endorsed by** Lauren Tan, and any errors in how the ideas are interpreted are mine. Please refer to the original talk.
 
 ## Language
