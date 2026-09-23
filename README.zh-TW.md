@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/banner.png" alt="ask-poteto：給程式代理的五層診斷框架" width="100%"></p>
+
 # ask-poteto
 
 [English](README.md) | **繁體中文**

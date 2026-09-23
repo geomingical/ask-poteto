@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/banner.png" alt="ask-poteto: five-layer diagnostic framework for coding agents" width="100%"></p>
+
 # ask-poteto
 
 **English** | [繁體中文](README.zh-TW.md)
