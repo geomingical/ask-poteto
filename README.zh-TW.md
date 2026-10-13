@@ -81,10 +81,12 @@ git clone https://github.com/geomingical/ask-poteto.git .claude/skills/ask-potet
 
 運作流程：
 
-1. 內附腳本把對話紀錄壓成一份純文字摘要，放在暫存資料夾：保留完整對話、縮短工具呼叫、丟掉圖片、遮蔽看起來像金鑰的字串，並標出可能把錯誤藏起來的指令。
+1. 內附腳本把對話紀錄壓成一份純文字摘要，放在暫存資料夾：保留完整對話與 Claude 實際下的指令、縮短工具輸出、丟掉圖片、遮蔽看起來像金鑰或密碼的字串、列出當時載入的指示檔，並標出可能把錯誤藏起來的指令。摘要很長時，會先問你要完整診斷，還是只看其中一段（比較省額度）。
 2. Claude 列出當時生效的指示檔，分成全域與專案。
-3. 派一個只能讀檔的 subagent（另一個有乾淨閱讀空間的 Claude 助手），依 [`references/rubric.md`](references/rubric.md) 的準則讀摘要、寫診斷。
-4. 主 Claude 抽查引用的原文證據，整理成給你看的報告，再刪掉暫存摘要。
+3. 派一個 subagent（另一個有乾淨閱讀空間的 Claude 助手），依 [`references/rubric.md`](references/rubric.md) 的準則讀摘要、寫診斷。它被要求只讀不改檔，這是靠指示約束，不是技術上的鎖。
+4. 主 Claude 抽查引用的原文證據，整理成一個畫面看得完的**短版報告**：一句話結論、你的提示可以怎麼說得更好、下次最值得改的 3 件事（附可直接貼上的文字）。想看細節再要完整報告。
+
+只想檢查規則檔、不想挑對話，也可以直接說「檢查我的 CLAUDE.md」，它會只做指示檔的健康檢查。
 
 **它只提建議，不會改你的檔案。** 要你同意後才動手。
 
@@ -98,13 +100,13 @@ python3 scripts/condense_session.py digest <session-id> [<更多 ID> ...] --out 
 ## 隱私
 
 - 全部在本機執行。腳本只讀 `~/.claude/projects/`（Claude Code 存放對話紀錄的地方），摘要只寫到你指定的位置。
-- 摘要含有完整對話內容。金鑰遮蔽是**盡力而為**：能抓到常見的 token 格式和 `KEY=...` 這類寫法，但不是全部。不要把摘要分享出去。
+- 摘要含有完整對話內容。金鑰遮蔽是**盡力而為**：能抓到常見的 token 格式、`API_KEY=...` 這類寫法、網址裡的帳密、`Bearer` 權杖和「密碼是……」，但不是全部。不要把摘要分享出去。診斷結束、你不再追問後，暫存摘要會被刪掉。
 - 技能不會自己挑對話來讀，只診斷你指定的對話。
 
 ## 限制
 
 - Claude Code 的對話紀錄格式（`.jsonl`）不是公開文件化的格式，版本更新可能會變。如果摘要變空或缺內容，歡迎開 issue。
-- 「疑似糾正」和「可能吞掉錯誤」標記只是字串比對，會漏掉真正的問題，也會誤標無害的寫法，例如只是為了縮短輸出而用的 `| head` 也會被標到。
+- 「疑似糾正」和「可能吞掉錯誤」標記只是字串比對，會漏掉真正的問題，也會誤標無害的一般問句。「可能吞掉錯誤」只在測試、建置這類檢查指令上標記，其他藏錯的寫法要靠 subagent 讀指令原文判斷。
 - 單次對話樣本很小，只看過一次的問題，技能會把建議標為低信心。
 
 ## 檔案結構
@@ -113,7 +115,8 @@ python3 scripts/condense_session.py digest <session-id> [<更多 ID> ...] --out 
 ask-poteto/
 ├── SKILL.md                     # Claude 照著做的流程
 ├── references/rubric.md         # 給 subagent 讀的診斷準則
-└── scripts/condense_session.py  # 對話紀錄 → Markdown 摘要
+├── scripts/condense_session.py  # 對話紀錄 → Markdown 摘要
+└── tests/                       # 摘要腳本的測試：python3 -m unittest discover -s tests
 ```
 
 ## 授權

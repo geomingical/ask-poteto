@@ -81,10 +81,12 @@ You can also just ask in plain language, for example "diagnose that session", "w
 
 What happens:
 
-1. The bundled script condenses the session log into a text-only digest in a temporary folder. It keeps the full conversation, shortens tool calls, drops images, masks things that look like API keys, and flags commands that can hide a failure.
+1. The bundled script condenses the session log into a text-only digest in a temporary folder. It keeps the full conversation and the exact commands Claude ran, shortens tool output, drops images, masks things that look like keys or passwords, lists the instruction files that were loaded, and flags commands that can hide a failure. If the digest is long, you are asked first whether to diagnose all of it or only part (cheaper).
 2. Claude lists which instruction files were in effect, sorted into global and project-level.
-3. A read-only subagent (a helper Claude with a clean context window) reads the digest against [`references/rubric.md`](references/rubric.md) and writes the diagnosis.
-4. The main Claude spot-checks the quoted evidence, rewrites the report for you, and deletes the temporary digest.
+3. A subagent (a helper Claude with a clean context window) reads the digest against [`references/rubric.md`](references/rubric.md) and writes the diagnosis. It is instructed not to edit files; this is an instruction, not a technical lock.
+4. The main Claude spot-checks the quoted evidence and gives you a **short report** that fits on one screen: a one-line conclusion, how your prompts could be clearer, and the 3 changes most worth making (with text you can paste). Ask for the full report if you want the details.
+
+If you only want your rules checked, just say "check my CLAUDE.md"; no session is needed for that.
 
 **It only makes suggestions and never edits your files.** Changes are made only after you agree.
 
@@ -98,13 +100,13 @@ python3 scripts/condense_session.py digest <session-id> [<more-ids> ...] --out /
 ## Privacy
 
 - Everything runs locally. The script only reads `~/.claude/projects/`, where Claude Code keeps session logs, and writes the digest to wherever you point it.
-- The digest contains your full conversation text. Key masking is **best-effort**: it catches common token formats and `KEY=...` assignments, not everything. Don't share digests.
+- The digest contains your full conversation text. Masking is **best-effort**: it catches common token formats, `API_KEY=...` assignments, passwords in URLs, `Bearer` tokens and "password is ...", not everything. Don't share digests. The temporary digest is deleted once you have no more questions.
 - The skill never picks sessions on its own. It diagnoses only the sessions you name.
 
 ## Limitations
 
 - Claude Code's session log format (`.jsonl`) is not a documented public format and may change between versions. If the digest comes out empty or incomplete, please open an issue.
-- The "possible correction" and "may hide a failure" markers are just pattern matches. They miss real problems and flag harmless ones. For example, `| head` used only to shorten output gets flagged.
+- The "possible correction" and "may hide a failure" markers are just pattern matches. They miss real problems and flag harmless questions. "May hide a failure" is only flagged on check commands such as tests and builds; other cases rely on the subagent reading the commands themselves.
 - A single session is a small sample. The skill labels suggestions based on one session as low confidence.
 
 ## File structure
@@ -113,7 +115,8 @@ python3 scripts/condense_session.py digest <session-id> [<more-ids> ...] --out /
 ask-poteto/
 ├── SKILL.md                     # the workflow Claude follows
 ├── references/rubric.md         # diagnostic rubric read by the subagent
-└── scripts/condense_session.py  # session log → Markdown digest
+├── scripts/condense_session.py  # session log → Markdown digest
+└── tests/                       # tests for the digest script: python3 -m unittest discover -s tests
 ```
 
 ## License

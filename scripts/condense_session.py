@@ -8,8 +8,9 @@ Usage:
 Several targets (one piece of work resumed across sessions) are merged into one
 digest in chronological order, tagged S1, S2, ...
 
-The digest keeps every typed user message and assistant reply in full, shortens
-tool calls and results, and marks signals worth a diagnostician's attention:
+The digest keeps every typed user message and assistant reply in full, shows
+slash commands as one-line notes (not user turns), shortens tool calls and
+results, lists the instruction files Claude Code loaded, and marks signals worth a diagnostician's attention:
 tool errors, interruptions, denied tool calls, user turns that look like
 corrections, and shell commands written in a way that can hide a failure. The signals are hints for where to look, not verdicts.
 """
@@ -21,6 +22,8 @@ from datetime import datetime
 from pathlib import Path
 
 PROJECTS = Path.home() / ".claude" / "projects"
+# Above this size, reading the whole digest costs noticeably more usage; ask first.
+LARGE_DIGEST_KB = 300
 
 CORRECTION_HINTS = re.compile(
     r"不對|不是|錯了|有錯|為什麼|又|不要|別再|我說|重做|重來|改回|看清楚|沒有照|不行|"
@@ -67,16 +70,27 @@ TOKEN_PATTERNS = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
 ]
-ASSIGNMENT_PATTERN = re.compile(r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD)[A-Z0-9_]*)(\s*[=:]\s*)\S+")
+# A secret-looking name followed by "=" or ":". The keyword must be the whole name
+# or a separated part of it (OPENAI_API_KEY, apiKey), so "monkey" and "max_tokens" stay.
+SECRET_NAME = r"(?:[A-Za-z0-9]+[_-])*(?:api_?key|key|token|secret|password|passwd|pwd)(?:[_-][A-Za-z0-9]+)*"
+ASSIGNMENT_PATTERN = re.compile(rf"(?i)\b({SECRET_NAME})(\s*[=:：]\s*)[^\s,;]+")
+SPOKEN_PASSWORD = re.compile(r"(?i)\b(password|passwd)(\s+(?:is|=)\s+)\S+|(密碼)(\s*(?:是|為|:|：)\s*)\S+")
+URL_CREDENTIALS = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@", re.IGNORECASE)
+BEARER_TOKEN = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 TOOL_INPUT_LIMIT = 300
+COMMAND_LIMIT = 600
 TOOL_RESULT_LIMIT = 400
 ERROR_RESULT_LIMIT = 1200
-ASSISTANT_TEXT_LIMIT = 4000
+# Records Claude Code writes as "user" but that the person did not type as a message.
+COMMAND_TAGS = ("<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>")
 
 
 def redact(text):
     for pattern in TOKEN_PATTERNS:
         text = pattern.sub("<redacted>", text)
+    text = URL_CREDENTIALS.sub(lambda m: m.group(1) + "<redacted>@", text)
+    text = BEARER_TOKEN.sub(lambda m: m.group(1) + "<redacted>", text)
+    text = SPOKEN_PASSWORD.sub(lambda m: (m.group(1) or m.group(3)) + (m.group(2) or m.group(4)) + "<redacted>", text)
     return ASSIGNMENT_PATTERN.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text)
 
 
@@ -160,23 +174,66 @@ def block_text(content):
     return ""
 
 
-def is_typed_user(record):
+def slash_command(record):
+    """Return the slash command text (e.g. "/login") or its output, else None."""
     if record.get("type") != "user" or record.get("isMeta"):
+        return None
+    content = block_text((record.get("message") or {}).get("content")).strip()
+    if not content.startswith(COMMAND_TAGS):
+        return None
+    name = re.search(r"<command-name>(.*?)</command-name>", content, re.DOTALL)
+    args = re.search(r"<command-args>(.*?)</command-args>", content, re.DOTALL)
+    if name:
+        return f"{name.group(1).strip()} {args.group(1).strip() if args else ''}".strip()
+    output = re.sub(r"</?local-command-std(?:out|err)>", "", content).strip()
+    return f"（指令輸出）{output}"
+
+
+def has_typed_request(record):
+    """True when a slash command carries text the person typed after it."""
+    content = block_text((record.get("message") or {}).get("content"))
+    args = re.search(r"<command-args>(.*?)</command-args>", content, re.DOTALL)
+    return bool(args and args.group(1).strip())
+
+
+def user_text(record):
+    """What the person typed: plain message text, or "/command request"."""
+    note = slash_command(record)
+    return note if note is not None else block_text(record["message"].get("content"))
+
+
+def is_typed_user(record):
+    if record.get("type") != "user" or record.get("isMeta") or record.get("isCompactSummary"):
         return False
     content = (record.get("message") or {}).get("content")
     if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
+        return False
+    if slash_command(record) is not None and not has_typed_request(record):
         return False
     origin = record.get("origin") or {}
     return origin.get("kind", "human") == "human"
 
 
-def fmt_time(stamp):
-    if not stamp:
-        return "--:--"
-    try:
-        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone().strftime("%H:%M")
-    except ValueError:
-        return stamp[:16]
+def instruction_paths(record):
+    """Paths of instruction files (CLAUDE.md, rules, memory) recorded as loaded."""
+    attachment = record.get("attachment") or {}
+    if attachment.get("type") == "instructions":
+        return [f.get("path") for f in attachment.get("files") or [] if isinstance(f, dict) and f.get("path")]
+    if attachment.get("type") == "nested_memory" and attachment.get("path"):
+        return [attachment["path"]]
+    return []
+
+
+def tool_brief(payload):
+    """One-line view of a tool call; shell commands are shown verbatim."""
+    command = payload.get("command")
+    if command:
+        brief = f"`{clip(redact(str(command)), COMMAND_LIMIT)}`"
+        if payload.get("description"):
+            brief += f"（{clip(str(payload['description']), 80)}）"
+        return brief
+    detail = payload.get("file_path") or payload.get("description") or payload.get("prompt") or json.dumps(payload, ensure_ascii=False)
+    return clip(redact(str(detail)), TOOL_INPUT_LIMIT)
 
 
 def summarize_session(path):
@@ -190,8 +247,9 @@ def summarize_session(path):
         "modified": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
         "size_mb": path.stat().st_size / 1_000_000,
         "user_turns": len(typed),
-        "hint_turns": sum(1 for r in typed if CORRECTION_HINTS.search(block_text(r["message"].get("content")))),
-        "title": title or clip(block_text(first_user["message"].get("content")) if first_user else "", 60),
+        # Same rule as the digest: the opening message is never counted as a correction.
+        "hint_turns": sum(1 for r in typed[1:] if CORRECTION_HINTS.search(user_text(r))),
+        "title": title or clip(user_text(first_user) if first_user else "", 60),
     }
 
 
@@ -250,14 +308,23 @@ def digest_one(path, tag, keep_results):
         meta["version"] = meta["version"] or record.get("version")
         if kind == "permission-mode":
             meta["permission"].add(record.get("permissionMode"))
-        if kind == "system" and "loaded" in str(record.get("content", "")):
-            meta["instructions"].append(str(record.get("content")))
+        for loaded in instruction_paths(record):
+            if loaded not in meta["instructions"]:
+                meta["instructions"].append(loaded)
         when = fmt_day(record.get("timestamp")) if record.get("timestamp") else "--"
         message = record.get("message") or {}
 
+        command_note = slash_command(record)
+        if command_note is not None and not is_typed_user(record):
+            lines.append(f"- ⌨ 使用者執行斜線指令：{clip(redact(command_note), TOOL_INPUT_LIMIT)}")
+            continue
+        if kind == "user" and record.get("isCompactSummary"):
+            lines.append(f"\n> 〔{when} 對話在這裡被壓縮（compact），之前的內容由系統摘要取代〕\n")
+            continue
+
         if is_typed_user(record):
             turn += 1
-            text = redact(block_text(message.get("content")))
+            text = redact(user_text(record))
             flag = ""
             if CORRECTION_HINTS.search(text) and turn > 1:
                 flag = " ⚑疑似糾正"
@@ -273,13 +340,12 @@ def digest_one(path, tag, keep_results):
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "text" and block.get("text", "").strip():
-                    lines.append(f"\n**【Claude】{when}**\n\n{clip(redact(block['text']), ASSISTANT_TEXT_LIMIT)}\n")
+                    lines.append(f"\n**【Claude】{when}**\n\n{redact(block['text']).strip()}\n")
                 elif block.get("type") == "tool_use":
                     name = block.get("name", "?")
                     tool_names[block.get("id")] = name
                     payload = block.get("input") or {}
-                    brief = payload.get("description") or payload.get("command") or payload.get("file_path") or payload.get("prompt") or json.dumps(payload, ensure_ascii=False)
-                    lines.append(f"- 🔧 {name}：{clip(redact(str(brief)), TOOL_INPUT_LIMIT)}")
+                    lines.append(f"- 🔧 {name}：{tool_brief(payload)}")
                     command = str(payload.get("command") or "")
                     if ERROR_SWALLOW_HINTS.search(command):
                         loose_swallows += 1
@@ -316,7 +382,11 @@ def digest_one(path, tag, keep_results):
         f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次；檢查結果可能被吞掉的指令 {swallows} 次",
         f"- 另有 {loose_swallows} 個指令用了 `| head`、`2>/dev/null` 等寫法，多半只是縮短輸出，未逐一列出；診斷時可視需要 grep 原始紀錄",
     ]
-    header += [f"- 載入的指示檔（系統紀錄）：{item}" for item in meta["instructions"]]
+    if meta["instructions"]:
+        header.append("- 載入的指示檔（依紀錄，出現順序）：")
+        header += [f"  - `{item}`" for item in meta["instructions"]]
+    else:
+        header.append("- 載入的指示檔：紀錄裡找不到（可能是 Claude Code 紀錄格式變了），請改從工作目錄與 `~/.claude/` 推斷")
     subagent_logs = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
     if subagent_logs:
         header.append(f"- 另有 {len(subagent_logs)} 份 subagent 紀錄（可用同一支腳本另做摘要）：")
@@ -349,7 +419,10 @@ def cmd_digest(args):
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(doc) + "\n", encoding="utf-8")
-    print(f"已寫入 {out}（{out.stat().st_size / 1000:.0f} KB，{len(paths)} 個 session，使用者 {total_turns} 輪，訊號 {len(all_signals)} 則）")
+    size_kb = out.stat().st_size / 1000
+    print(f"已寫入 {out}（{size_kb:.0f} KB，{len(paths)} 個 session，使用者 {total_turns} 輪，訊號 {len(all_signals)} 則）")
+    if size_kb > LARGE_DIGEST_KB:
+        print(f"注意：摘要超過 {LARGE_DIGEST_KB} KB，完整讀完會用掉較多額度與時間。", file=sys.stderr)
 
 
 def main():
