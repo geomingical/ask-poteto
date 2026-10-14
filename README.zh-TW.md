@@ -4,7 +4,7 @@
 
 [English](README.md) | **繁體中文**
 
-一個 [Claude Code](https://claude.com/claude-code) 技能（skill）：**診斷某次對話卡在哪裡，以及下一步該建什麼，讓同樣的問題不再發生。**
+一個 [Claude Code](https://claude.com/claude-code) 技能（skill）：**診斷某次對話卡在哪裡，以及下一步該建什麼，讓同樣的問題不再發生。** 可以讀 **Claude Code、Codex CLI、OMP（oh-my-pi）** 三種工具的對話紀錄。
 
 給它一次對話，或同一件工作被重開的好幾次對話。它會讀完整份紀錄，包括你的發言和每一次工具呼叫。每當你**糾正或介入** Claude，它都問一句：*這個錯本來可以在哪一層被擋下？*
 
@@ -75,6 +75,7 @@ git clone https://github.com/geomingical/ask-poteto.git .claude/skills/ask-potet
 /ask-poteto current             # 診斷目前這個對話（到上一輪為止）
 /ask-poteto 3f2a9c1b            # 診斷某一次對話（ID 給前幾碼即可）
 /ask-poteto 3f2a9c1b 8e7d6c5a   # 同一件工作重開的多次對話，依時間合併一起診斷
+/ask-poteto 01a134cb            # Codex 或 OMP 的對話也一樣，會自動判斷是哪個工具
 ```
 
 也可以直接用白話說，例如「診斷那次對話」「為什麼 Claude 一直做錯」「檢查我的 CLAUDE.md 有沒有問題」。
@@ -93,19 +94,28 @@ git clone https://github.com/geomingical/ask-poteto.git .claude/skills/ask-potet
 ### 單獨使用腳本
 
 ```bash
-python3 scripts/condense_session.py list --project my-app --limit 20
+python3 scripts/condense_session.py list --project my-app --limit 20             # 三種工具一起列
+python3 scripts/condense_session.py list --source codex --limit 20               # 只列 Codex（或 omp、claude）
 python3 scripts/condense_session.py digest <session-id> [<更多 ID> ...] --out /tmp/digest.md
 ```
 
+Codex 或 OMP 的 session ID 用法一樣，腳本會從紀錄內容判斷是哪個工具；同一件工作在不同工具之間接力時，也可以把它們合併成一份摘要。
+
+| 工具 | 紀錄位置 | 說明 |
+|---|---|---|
+| Claude Code | `~/.claude/projects/` | 載入了哪些指示檔，從紀錄裡讀出來。 |
+| Codex CLI | `~/.codex/sessions/`、`~/.codex/archived_sessions/` | Codex 自己塞進你訊息裡的內容（AGENTS.md、環境資訊、IDE 狀態）不算你說的話。subagent 的紀錄列在主對話摘要開頭。 |
+| OMP | `~/.omp/agent/sessions/` | OMP 不記錄載入了哪些指示檔，那份清單是推斷的。因為額度或連線錯誤被自動重送很多次的同一句話，會合併成一輪並標出次數。 |
+
 ## 隱私
 
-- 全部在本機執行。腳本只讀 `~/.claude/projects/`（Claude Code 存放對話紀錄的地方），摘要只寫到你指定的位置。
+- 全部在本機執行。腳本只讀上表列出的紀錄資料夾（`~/.claude/projects/`、`~/.codex/sessions/`、`~/.codex/archived_sessions/`、`~/.omp/agent/sessions/`），摘要只寫到你指定的位置。
 - 摘要含有完整對話內容。金鑰遮蔽是**盡力而為**：能抓到常見的 token 格式、`API_KEY=...` 這類寫法、網址裡的帳密、`Bearer` 權杖和「密碼是……」，但不是全部。不要把摘要分享出去。診斷結束、你不再追問後，暫存摘要會被刪掉。
 - 技能不會自己挑對話來讀，只診斷你指定的對話。
 
 ## 限制
 
-- Claude Code 的對話紀錄格式（`.jsonl`）不是公開文件化的格式，版本更新可能會變。如果摘要變空或缺內容，歡迎開 issue。
+- 三種工具的對話紀錄格式（`.jsonl`）都不是公開文件化的格式，版本更新可能會變。Codex 與 OMP 的讀取是照 Codex CLI 0.10x–0.16x 與 OMP 紀錄格式 v3 寫的。如果摘要變空或缺內容，歡迎開 issue。
 - 「疑似糾正」和「可能吞掉錯誤」標記只是字串比對，會漏掉真正的問題，也會誤標無害的一般問句。「可能吞掉錯誤」只在測試、建置這類檢查指令上標記，其他藏錯的寫法要靠 subagent 讀指令原文判斷。
 - 單次對話樣本很小，只看過一次的問題，技能會把建議標為低信心。
 
@@ -115,7 +125,8 @@ python3 scripts/condense_session.py digest <session-id> [<更多 ID> ...] --out 
 ask-poteto/
 ├── SKILL.md                     # Claude 照著做的流程
 ├── references/rubric.md         # 給 subagent 讀的診斷準則
-├── scripts/condense_session.py  # 對話紀錄 → Markdown 摘要
+├── scripts/condense_session.py  # 對話紀錄 → Markdown 摘要（命令列、訊號、遮蔽）
+├── scripts/session_sources.py   # 讀 Claude Code、Codex CLI、OMP 三種紀錄
 └── tests/                       # 摘要腳本的測試：python3 -m unittest discover -s tests
 ```
 
