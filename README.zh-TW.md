@@ -131,8 +131,9 @@ Codex 或 OMP 的 session ID 用法一樣，腳本會從紀錄內容判斷是哪
 ask-poteto/
 ├── SKILL.md                     # Claude 照著做的流程
 ├── references/rubric.md         # 給 subagent 讀的診斷準則
-├── scripts/condense_session.py  # 對話紀錄 → Markdown 摘要（命令列、訊號、遮蔽）
+├── scripts/condense_session.py  # 對話紀錄 → Markdown 摘要（命令列、訊號）
 ├── scripts/session_sources.py   # 讀 Claude Code、Codex CLI、OMP 三種紀錄
+├── scripts/redaction.py         # 遮蔽看起來像金鑰、密碼的字串
 └── tests/                       # 摘要腳本的測試：python3 -m unittest discover -s tests
 ```
 

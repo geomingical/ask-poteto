@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 import session_sources as src
+from redaction import redact
 
 # Above this size, reading the whole digest costs noticeably more usage; ask first.
 LARGE_DIGEST_KB = 300
@@ -68,18 +69,6 @@ def risky_swallow(command):
     if FOLLOW_UP_ACTION.search(command) or forced:
         return list(dict.fromkeys(idioms))
     return []
-TOKEN_PATTERNS = [
-    re.compile(r"\b(?:sk|pk|rk|ghp|gho|github_pat|xox[abp])[-_][A-Za-z0-9_\-]{16,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
-]
-# A secret-looking name followed by "=" or ":". The keyword must be the whole name
-# or a separated part of it (OPENAI_API_KEY, apiKey), so "monkey" and "max_tokens" stay.
-SECRET_NAME = r"(?:[A-Za-z0-9]+[_-])*(?:api_?key|key|token|secret|password|passwd|pwd)(?:[_-][A-Za-z0-9]+)*"
-ASSIGNMENT_PATTERN = re.compile(rf"(?i)\b({SECRET_NAME})(\s*[=:：]\s*)[^\s,;]+")
-SPOKEN_PASSWORD = re.compile(r"(?i)\b(password|passwd)(\s+(?:is|=)\s+)\S+|(密碼)(\s*(?:是|為|:|：)\s*)\S+")
-URL_CREDENTIALS = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@", re.IGNORECASE)
-BEARER_TOKEN = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 TOOL_INPUT_LIMIT = 300
 COMMAND_LIMIT = 600
 CODE_LIMIT = 1500
@@ -89,15 +78,6 @@ ERROR_RESULT_LIMIT = 1200
 # must match, so an ordinary error that happens to contain "the user said:" stays an error.
 REJECTION_REASON = re.compile(r"doesn't want to proceed with this tool use.*?the user said:\s*(.+)",
                               re.IGNORECASE | re.DOTALL)
-
-
-def redact(text):
-    for pattern in TOKEN_PATTERNS:
-        text = pattern.sub("<redacted>", text)
-    text = URL_CREDENTIALS.sub(lambda m: m.group(1) + "<redacted>@", text)
-    text = BEARER_TOKEN.sub(lambda m: m.group(1) + "<redacted>", text)
-    text = SPOKEN_PASSWORD.sub(lambda m: (m.group(1) or m.group(3)) + (m.group(2) or m.group(4)) + "<redacted>", text)
-    return ASSIGNMENT_PATTERN.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text)
 
 
 def clip(text, limit):
@@ -181,6 +161,11 @@ def tool_brief(payload):
         if payload.get("description"):
             brief += f"（{safe(payload['description'], 80)}）"
         return brief
+    if payload.get("session_id") is not None and "chars" in payload:
+        earlier = f"先前的指令 `{safe(payload['continues'], COMMAND_LIMIT)}`" if payload.get("continues") else "先前的指令"
+        if payload["chars"].strip():
+            return f"送入文字 `{safe(payload['chars'], COMMAND_LIMIT)}` 給{earlier}"
+        return f"等待{earlier}"
     if payload.get("continues"):
         return f"等待先前的指令：`{safe(payload['continues'], COMMAND_LIMIT)}`"
     if payload.get("code"):

@@ -133,8 +133,9 @@ Where each tool keeps its logs, and what the digest does with each format:
 ask-poteto/
 ├── SKILL.md                     # the workflow Claude follows
 ├── references/rubric.md         # diagnostic rubric read by the subagent
-├── scripts/condense_session.py  # session log → Markdown digest (command line, signals, masking)
+├── scripts/condense_session.py  # session log → Markdown digest (command line, signals)
 ├── scripts/session_sources.py   # readers for Claude Code, Codex CLI and OMP logs
+├── scripts/redaction.py         # masks strings that look like keys or passwords
 └── tests/                       # tests for the digest script: python3 -m unittest discover -s tests
 ```
 

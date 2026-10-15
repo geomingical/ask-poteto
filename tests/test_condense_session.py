@@ -570,5 +570,94 @@ class ReReviewTest(unittest.TestCase):
         self.assertIn("AssertionError: the user said: hello", digest)
 
 
+# ---------------------------------------------------------------- third review follow-ups
+
+PEM_BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"
+
+
+class ThirdReviewTest(unittest.TestCase):
+    def test_trimming_never_exposes_part_of_a_private_key(self):
+        # The key is long enough that a head/tail cut always lands inside it.
+        pem = f"-----BEGIN PRIVATE KEY-----\n{PEM_BODY}\n" + "QUJD " * 800 + "\n-----END PRIVATE KEY-----"
+        for text, extra in (("x " * 3200 + pem, ()), (pem + " y" * 3200, ("--results",)),
+                            ("x " * 1400 + pem + " y" * 1400, ("--results",))):
+            with self.subTest(position=text.index("BEGIN"), extra=extra):
+                records = RECORDS[:1] + claude_tool("t1", "pytest -q", text)
+                with tempfile.TemporaryDirectory() as tmp:
+                    digest = run_digest(write_log(tmp, "pem.jsonl", records), extra=extra)
+                self.assertNotIn(PEM_BODY, digest)
+                self.assertNotIn("QUJD", digest)
+
+    def test_errors_win_over_running_and_outer_success(self):
+        cases = [
+            "Process running with session ID 4242\n" + json.dumps({"isError": True}),
+            "Process running with session ID 4242\nScript error: boom",
+            "Process running with session ID 4242\nrejected by user",
+            json.dumps({"exit_code": 0, "output": json.dumps({"exit_code": 1, "output": "inner failed"})}),
+        ]
+        for output in cases:
+            with self.subTest(output=output[:40]):
+                self.assertEqual(src.codex_output({"output": output}, shell=True)[1], "error")
+        self.assertEqual(src.codex_output({"output": "Process running with session ID 4242"}, shell=True)[1], "running")
+
+    def test_text_sent_to_a_running_command_is_kept(self):
+        records = [
+            codex_meta_record("019e0000-aaaa-7000-8000-0000000000f3"), codex_user("推上去"),
+            codex("response_item", {"type": "function_call", "name": "exec_command", "call_id": "c1",
+                                    "arguments": json.dumps({"cmd": "bash"})}),
+            codex("response_item", {"type": "function_call_output", "call_id": "c1",
+                                    "output": "Process running with session ID 77"}),
+            codex("response_item", {"type": "function_call", "name": "write_stdin", "call_id": "c2",
+                                    "arguments": json.dumps({"session_id": 77, "chars": "git push --force\n"})}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000f3.jsonl", records))
+        self.assertIn("git push --force", digest)
+
+    def test_code_mode_delayed_result_links_back(self):
+        records = [
+            codex_meta_record("019e0000-aaaa-7000-8000-0000000000f4"), codex_user("跑測試"),
+            codex("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": "c1",
+                                    "input": 'await tools.exec_command({cmd: "pytest -q"});'}),
+            codex("response_item", {"type": "custom_tool_call_output", "call_id": "c1",
+                                    "output": "Script completed\nOutput:\nProcess running with session ID 88"}),
+            codex("response_item", {"type": "function_call", "name": "write_stdin", "call_id": "c2",
+                                    "arguments": json.dumps({"session_id": 88, "chars": ""})}),
+            codex("response_item", {"type": "function_call_output", "call_id": "c2",
+                                    "output": "Process exited with code 0\nOutput:\n" + "." * 2000 + "\n17 passed"}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000f4.jsonl", records))
+        self.assertIn("17 passed", digest)
+
+
+class MaskingSpeedTest(unittest.TestCase):
+    """Long outputs without spaces once made masking take minutes; keep every case fast."""
+
+    def test_masking_stays_fast_on_long_inputs(self):
+        import time
+        cases = {
+            "underscore run": "a_" * 50000,
+            "dash run": "abc-" * 30000 + "x",
+            "long url": "http://" + "u" * 100000 + ":",
+            "long scheme": "u" * 100000 + "://",
+            "many starts": "-----BEGIN PRIVATE KEY-----\n" * 20000,
+            "many ends": "-----END PRIVATE KEY-----\n" * 20000,
+            "long assignment name": "key" + "_k" * 50000 + "=1",
+            "many colons": "a:" * 100000,
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                started = time.perf_counter()
+                cs.redact(text)
+                self.assertLess(time.perf_counter() - started, 2.0)
+
+    def test_private_keys_are_masked_whole_or_by_marker(self):
+        pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END RSA PRIVATE KEY-----"
+        self.assertEqual(cs.redact(f"a {pem} b {pem} c"), "a <redacted> b <redacted> c")
+        self.assertEqual(cs.redact("see the key\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY----- ok"),
+                         "see the key\n<redacted> ok")
+
+
 if __name__ == "__main__":
     unittest.main()

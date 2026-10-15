@@ -2,7 +2,9 @@
 
 Each reader turns a .jsonl log into a SessionLog: metadata plus a list of
 Events in time order. condense_session.py renders that shape as Markdown; this
-module does no formatting, redaction or clipping.
+module does no formatting. Tool results are the one exception to "no redaction":
+they are masked whole and then trimmed here, so huge outputs never stay in
+memory and a trim can never cut a secret in half before it is masked.
 
 None of the three formats is a documented public format. The readers keep only
 what the digest needs and skip records they do not recognise.
@@ -14,6 +16,8 @@ import re
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+from redaction import redact
 
 CLAUDE_ROOT = Path.home() / ".claude" / "projects"
 CODEX_ROOTS = (Path.home() / ".codex" / "sessions", Path.home() / ".codex" / "archived_sessions")
@@ -139,7 +143,8 @@ def trim_result(text: str) -> str:
 
 
 def result_event(when: str, text: str, name: str, status: str, call_id: str) -> Event:
-    return Event("result", when, trim_result(text), name, status=status, call_id=call_id, length=len(text))
+    """A tool result, masked while still whole and only then trimmed."""
+    return Event("result", when, trim_result(redact(text)), name, status=status, call_id=call_id, length=len(text))
 
 
 def first_timestamp(path: Path) -> str:
@@ -444,7 +449,8 @@ def codex_tool_events(when: str, payload: dict) -> list:
         if command:
             args = {"command": command, "description": args.get("justification") or ""}
         elif name == "write_stdin" and args.get("session_id") is not None:
-            args = {"session_id": str(args["session_id"])}  # linked to its command in read_codex
+            # What was typed into the running command matters (it may be "git push --force").
+            args = {"session_id": str(args["session_id"]), "chars": str(args.get("chars") or "")}
         return [Event("tool", when, name=name, payload=args, call_id=call_id)]
     code = str(payload.get("input") or "")
     commands = [unquote(m) for m in CODEX_EMBEDDED_CMD.findall(code)]
@@ -488,16 +494,18 @@ def codex_output(payload: dict, shell: bool = False):
         found = CODEX_EXIT.search(text)
         if found:
             exit_code = int(found.group(1) or found.group(2))
-    nested = [int(code) for code in CODEX_NESTED_EXIT.findall(text)]  # results printed inside a code-mode script
-    if exit_code is None and nested:
-        exit_code = next((code for code in nested if code != 0), 0)
+    # Exit codes printed inside the output (a code-mode script, a nested tool result).
+    # Any failing step fails the call, even when the outer wrapper reports success.
+    nested = [int(code) for code in CODEX_NESTED_EXIT.findall(text)]
+    if not flagged and parsed is None:
+        flagged = bool(re.search(r'"is_?[eE]rror"\s*:\s*true', text))
+    failed = flagged or (exit_code not in (None, 0)) or any(code != 0 for code in nested) \
+        or bool(re.search(r"^Script error:", text, re.MULTILINE)) or "rejected by user" in text.lower()
+    if failed:  # checked first: a failure must never be hidden behind "still running"
+        return text, "error"
     if CODEX_RUNNING.search(text) and exit_code is None:
         return text, "running"
-    failed = flagged or (exit_code not in (None, 0)) or bool(re.search(r"^Script error:", text, re.MULTILINE)) \
-        or "rejected by user" in text.lower()
-    if failed:
-        return text, "error"
-    if shell and exit_code is None:
+    if shell and exit_code is None and not nested:
         return text, "unknown"
     return text, "ok"
 
@@ -554,8 +562,11 @@ def read_codex(path: Path) -> SessionLog:
             events = codex_tool_events(when, payload)
             if events[0].payload.get("command"):
                 commands[call_id] = events[0].payload["command"]
-            if any(e.name.endswith("→shell") for e in events):
+            steps = [e.payload["command"] for e in events if e.name.endswith("→shell")]
+            if steps:
                 shell_calls.add(call_id)
+                # A script may run several commands; a later poll is linked to all of them.
+                commands[call_id] = " ；".join(steps)
             if events[0].name == "write_stdin" and events[0].payload.get("session_id") in running:
                 earlier = running[events[0].payload["session_id"]]
                 commands[call_id] = earlier
