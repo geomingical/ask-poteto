@@ -13,7 +13,6 @@ import json
 import re
 import sys
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
 from pathlib import Path
 
 CLAUDE_ROOT = Path.home() / ".claude" / "projects"
@@ -37,13 +36,15 @@ class Event:
     """One thing that happened in a session, in the order it was recorded.
 
     kind: user, assistant, tool, result, note, compact, interrupt or api_error.
+    A result's status is "ok", "error" or "unknown" (the log did not say whether it worked).
     """
     kind: str
     when: str = ""
     text: str = ""
     name: str = ""
     payload: dict = field(default_factory=dict)
-    is_error: bool = False
+    status: str = "ok"
+    call_id: str = ""  # links a tool call to its result
     steering: bool = False  # typed while the agent was still working
     repeat: int = 1  # identical retries folded into this event
 
@@ -58,6 +59,7 @@ class SessionLog:
     models: set = field(default_factory=set)
     permission: set = field(default_factory=set)
     instructions: list = field(default_factory=list)
+    injected_rules: list = field(default_factory=list)  # rules a tool applied mid-session, not files
     subagent_logs: list = field(default_factory=list)
     title: str = ""
     events: list = field(default_factory=list)
@@ -82,18 +84,20 @@ class SessionLog:
         return next((e.when for e in self.events if e.when), "")
 
 
-def read_records(path: Path) -> list:
-    records = []
+def read_records(path: Path):
+    """Yield records one line at a time, so a large log is never held in memory whole."""
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError as error:
                 print(f"警告：{path.name} 第 {line_number} 行不是合法 JSON，已略過（{error}）", file=sys.stderr)
-    return records
+                continue
+            if isinstance(record, dict):
+                yield record
 
 
 def head_records(path: Path, max_lines: int = 200):
@@ -108,6 +112,11 @@ def head_records(path: Path, max_lines: int = 200):
                 continue
             if isinstance(record, dict):
                 yield record
+
+
+def first_timestamp(path: Path) -> str:
+    """Timestamp of the first timed record, read from the start of the file only."""
+    return next((str(r["timestamp"]) for r in head_records(path) if r.get("timestamp")), "")
 
 
 def detect_source(path: Path) -> str:
@@ -258,7 +267,8 @@ def collapse_retries(events: list) -> list:
     """Fold automatic retries: the same message re-sent after nothing but errors, and repeated identical errors.
 
     A rate-limited session can resend one message thousands of times; without this
-    the digest would be mostly copies.
+    the digest would be mostly copies. An interruption in between means the person
+    stopped the agent and said it again, which is a correction, so it is never folded.
     """
     folded = []
     for event in events:
@@ -268,7 +278,7 @@ def collapse_retries(events: list) -> list:
             continue
         if event.kind == "user":
             index = len(folded) - 1
-            while index >= 0 and folded[index].kind in ("api_error", "interrupt"):
+            while index >= 0 and folded[index].kind == "api_error":
                 index -= 1
             if 0 <= index < len(folded) - 1 and folded[index].kind == "user" and folded[index].text == event.text:
                 folded[index] = replace(folded[index], repeat=folded[index].repeat + 1)
@@ -315,13 +325,15 @@ def read_claude(path: Path) -> SessionLog:
                 elif block.get("type") == "tool_use":
                     name = block.get("name", "?")
                     tool_names[block.get("id")] = name
-                    log.events.append(Event("tool", when, name=name, payload=block.get("input") or {}))
+                    log.events.append(Event("tool", when, name=name, payload=block.get("input") or {},
+                                            call_id=str(block.get("id") or "")))
         elif kind == "user":
             for block in message.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     name = tool_names.get(block.get("tool_use_id"), "?")
                     log.events.append(Event("result", when, block_text(block.get("content")), name,
-                                            is_error=bool(block.get("is_error"))))
+                                            status="error" if block.get("is_error") else "ok",
+                                            call_id=str(block.get("tool_use_id") or "")))
     log.subagent_logs = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
     return log
 
@@ -337,7 +349,8 @@ CODEX_CONTEXT_TAGS = (
 CODEX_CONTEXT_HEADINGS = ("# Context from my IDE setup", "# Files mentioned by the user", "# In app browser")
 CODEX_REQUEST = re.compile(r"^## My request(?: for Codex)?:[ \t]*\n?", re.MULTILINE)
 CODEX_IMAGE_LABEL = re.compile(r"^\s*(?:</?image[^>]*>|\[Image #\d+\])\s*$")
-CODEX_EXIT = re.compile(r"Process exited with code ([1-9]\d*)|^Exit code: ([1-9]\d*)", re.MULTILINE)
+CODEX_EXIT = re.compile(r"Process exited with code (-?\d+)|^Exit code: (-?\d+)", re.MULTILINE)
+CODEX_SHELL_TOOLS = ("exec_command", "shell", "shell_command")
 # Shell commands written inside Codex "code mode" scripts: tools.exec_command({cmd: "..."}).
 CODEX_EMBEDDED_CMD = re.compile(r"""\bcmd\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)""")
 PATCH_FILE = re.compile(r"\*\*\* (?:Add|Update|Delete) File: ([^\n\"'\\]+)")
@@ -388,6 +401,7 @@ def codex_shell_command(name: str, args: dict) -> str:
 
 def codex_tool_events(when: str, payload: dict) -> list:
     name = payload.get("name", "?")
+    call_id = str(payload.get("call_id") or "")
     if payload.get("type") == "function_call":
         try:
             args = json.loads(payload.get("arguments") or "{}")
@@ -395,35 +409,59 @@ def codex_tool_events(when: str, payload: dict) -> list:
             args = {"arguments": payload.get("arguments")}
         if not isinstance(args, dict):
             args = {"arguments": args}
-        command = codex_shell_command(name, args) if name in ("exec_command", "shell", "shell_command") else ""
+        command = codex_shell_command(name, args) if name in CODEX_SHELL_TOOLS else ""
         if command:
             args = {"command": command, "description": args.get("justification") or ""}
-        return [Event("tool", when, name=name, payload=args)]
+        return [Event("tool", when, name=name, payload=args, call_id=call_id)]
     code = str(payload.get("input") or "")
     commands = [unquote(m) for m in CODEX_EMBEDDED_CMD.findall(code)]
-    if commands:
-        return [Event("tool", when, name=name, payload={"command": c}) for c in commands]
     files = list(dict.fromkeys(f.strip() for f in PATCH_FILE.findall(code)))
-    detail = "修改檔案：" + "、".join(files) if files else code
-    return [Event("tool", when, name=name, payload={"description": detail})]
+    if not commands:
+        detail = "修改檔案：" + "、".join(files) if files and name == "apply_patch" else code
+        return [Event("tool", when, name=name, payload={"description": detail}, call_id=call_id)]
+    # A script can do more than run shell commands (edit or delete files, call other tools).
+    # Keep the whole script; the extracted commands are extra hints for the swallow check.
+    summary = f"程式內容（含 {len(commands)} 個 shell 指令" + (f"，動到檔案：{'、'.join(files)}" if files else "") + "）"
+    events = [Event("tool", when, name=name, payload={"code": code, "description": summary}, call_id=call_id)]
+    return events + [Event("tool", when, name=f"{name}→shell", payload={"command": c}) for c in commands]
 
 
-def codex_output(payload: dict):
-    """(text, is_error) for a Codex tool output record."""
+def codex_json(text: str):
+    """The tool output as a dict when it is a JSON object, else None."""
+    if not text.lstrip().startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def codex_output(payload: dict, shell: bool = False):
+    """(text, status) for a Codex tool output record; status is "ok", "error" or "unknown".
+
+    Shell results whose exit status cannot be found are "unknown", never assumed to have worked.
+    """
     output = payload.get("output")
-    exit_code = None
-    if isinstance(output, str) and output.startswith("{"):
-        try:
-            parsed = json.loads(output)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict) and "output" in parsed:
-            exit_code = (parsed.get("metadata") or {}).get("exit_code")
-            output = str(parsed["output"])
     text = block_text(output)
-    failed = (exit_code not in (None, 0)) or bool(CODEX_EXIT.search(text)) \
-        or bool(re.search(r"^Script error:", text, re.MULTILINE)) or "rejected by user" in text.lower()
-    return text, failed
+    exit_code, flagged = None, False
+    parsed = codex_json(text)
+    if parsed is not None:
+        exit_code = parsed.get("exit_code", (parsed.get("metadata") or {}).get("exit_code"))
+        flagged = bool(parsed.get("isError") or parsed.get("is_error"))
+        if "output" in parsed:
+            text = block_text(parsed["output"]) if not isinstance(parsed["output"], str) else parsed["output"]
+    if exit_code is None:
+        found = CODEX_EXIT.search(text)
+        if found:
+            exit_code = int(found.group(1) or found.group(2))
+    failed = flagged or (exit_code not in (None, 0)) or bool(re.search(r"^Script error:", text, re.MULTILINE)) \
+        or "rejected by user" in text.lower()
+    if failed:
+        return text, "error"
+    if shell and exit_code is None:
+        return text, "unknown"
+    return text, "ok"
 
 
 def read_codex(path: Path) -> SessionLog:
@@ -473,21 +511,31 @@ def read_codex(path: Path) -> SessionLog:
             tool_names[payload.get("call_id")] = payload.get("name", "?")
             log.events += codex_tool_events(when, payload)
         elif kind == "response_item" and what in ("function_call_output", "custom_tool_call_output"):
-            text, failed = codex_output(payload)
-            log.events.append(Event("result", when, text, tool_names.get(payload.get("call_id"), "?"), is_error=failed))
+            name = tool_names.get(payload.get("call_id"), "?")
+            text, status = codex_output(payload, shell=name in CODEX_SHELL_TOOLS)
+            log.events.append(Event("result", when, text, name, status=status, call_id=str(payload.get("call_id") or "")))
     log.title = next((e.text.strip()[:60] for e in log.events if e.kind == "user"), "")
-    log.subagent_logs = codex_children().get(log.id, [])
+    log.subagent_logs = codex_children(path, log.id)
     return log
 
 
-@lru_cache(maxsize=1)
-def codex_children() -> dict:
-    """Parent session ID -> logs of the helper agents it spawned (scanned once per run)."""
-    children = {}
-    for path in sorted(all_logs("codex")):
-        parent = codex_parent(path)
-        if parent:
-            children.setdefault(parent, []).append(path)
+def codex_children(path: Path, parent_id: str) -> list:
+    """Helper-agent logs this session spawned.
+
+    Only logs in the same folder (Codex groups logs by day) are opened, and only
+    their first line, so diagnosing one session does not read the user's other
+    sessions. A helper started after midnight lands in the next day's folder and
+    is missed; the digest header says so.
+    """
+    children = []
+    for sibling in sorted(path.parent.glob("rollout-*.jsonl")):
+        if sibling == path:
+            continue
+        try:
+            if codex_parent(sibling) == parent_id:
+                children.append(sibling)
+        except OSError as error:
+            print(f"警告：無法讀取 {sibling.name}，略過（{error}）", file=sys.stderr)
     return children
 
 
@@ -526,7 +574,8 @@ def read_omp(path: Path) -> SessionLog:
             log.models.add(str(record["model"]))
         elif kind == "ttsr_injection":
             for rule in record.get("injectedRules") or []:
-                log.add_instruction(f"規則：{rule}")
+                if rule not in log.injected_rules:
+                    log.injected_rules.append(str(rule))
         elif kind == "compaction":
             log.events.append(Event("compact", when))
         elif kind == "branch_summary":
@@ -545,15 +594,17 @@ def read_omp(path: Path) -> SessionLog:
                     log.events.append(Event("assistant", when, block["text"]))
                 elif block.get("type") == "toolCall":
                     log.events.append(Event("tool", when, name=block.get("name", "?"),
-                                            payload=omp_payload(block.get("arguments"), block.get("intent"))))
+                                            payload=omp_payload(block.get("arguments"), block.get("intent")),
+                                            call_id=str(block.get("id") or "")))
             if message.get("stopReason") == "aborted":
                 log.events.append(Event("interrupt", when))
             elif message.get("stopReason") == "error":
                 log.events.append(Event("api_error", when, str(message.get("errorMessage") or "")))
         elif role == "toolResult":
             exit_code = (message.get("details") or {}).get("exitCode") if isinstance(message.get("details"), dict) else None
+            failed = bool(message.get("isError")) or exit_code not in (None, 0)
             log.events.append(Event("result", when, block_text(message.get("content")), message.get("toolName", "?"),
-                                    is_error=bool(message.get("isError")) or exit_code not in (None, 0)))
+                                    status="error" if failed else "ok", call_id=str(message.get("toolCallId") or "")))
     log.subagent_logs = sorted((path.parent / path.stem).glob("*.jsonl"))
     return log
 

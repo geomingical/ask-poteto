@@ -3,6 +3,7 @@
 Run: python3 -m unittest discover -s tests
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,11 @@ SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "condense_session.
 sys.path.insert(0, str(SCRIPT.parent))
 import condense_session as cs  # noqa: E402
 import session_sources as src  # noqa: E402
+
+# Every subprocess runs with this empty home, so no test can read real session logs.
+FAKE_HOME = tempfile.mkdtemp(prefix="ask-poteto-home-")
+ENV = {**os.environ, "HOME": FAKE_HOME}
+ENV.pop("CLAUDE_CODE_SESSION_ID", None)
 
 LONG_REPLY = "開頭。" + "很長的說明。" * 1200 + "結尾的測試證據"
 
@@ -49,7 +55,8 @@ class CondenseSessionTest(unittest.TestCase):
         cls.log = Path(cls.tmp.name) / "abc123.jsonl"
         cls.log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in RECORDS) + "\n", encoding="utf-8")
         out = Path(cls.tmp.name) / "digest.md"
-        subprocess.run([sys.executable, str(SCRIPT), "digest", str(cls.log), "--out", str(out)], check=True, capture_output=True)
+        subprocess.run([sys.executable, str(SCRIPT), "digest", str(cls.log), "--out", str(out)],
+                       check=True, capture_output=True, env=ENV)
         cls.digest = out.read_text(encoding="utf-8")
 
     @classmethod
@@ -144,9 +151,16 @@ def write_log(folder, name, records):
     return path
 
 
-def run_digest(*targets):
+def run_script(*args, env=None, cwd=None):
+    return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], capture_output=True, text=True,
+                          env=env or ENV, cwd=cwd)
+
+
+def run_digest(*targets, extra=(), env=None):
     out = Path(tempfile.mkdtemp()) / "digest.md"
-    subprocess.run([sys.executable, str(SCRIPT), "digest", *map(str, targets), "--out", str(out)], check=True, capture_output=True)
+    done = run_script("digest", *targets, "--out", out, *extra, env=env)
+    if done.returncode != 0:
+        raise AssertionError(done.stderr)
     return out.read_text(encoding="utf-8")
 
 
@@ -186,7 +200,8 @@ class CodexTest(unittest.TestCase):
     def test_shell_commands_errors_and_swallows(self):
         self.assertIn("🔧 exec_command：`pytest -q || true`", self.digest)
         self.assertIn("❌ 錯誤（exec_command）", self.digest)
-        self.assertIn("🔧 exec：`npm test 2>/dev/null && git push`", self.digest)
+        self.assertIn("🔧 exec→shell：`npm test 2>/dev/null && git push`", self.digest)
+        self.assertIn("程式內容（含 1 個 shell 指令）", self.digest)
         self.assertEqual(self.digest.count("檢查結果可能被吞掉："), 2)
 
     def test_interrupt_and_compaction(self):
@@ -288,6 +303,188 @@ class RedactTest(unittest.TestCase):
         for text in ["monkey = banana", "max_tokens: 4000", "the key is important"]:
             with self.subTest(text=text):
                 self.assertEqual(cs.redact(text), text)
+
+
+# ---------------------------------------------------------------- group 1: right session, privacy
+
+def claude_log(cwd, text, when="2026-10-13T01:00:00Z"):
+    return [{"type": "user", "cwd": cwd, "timestamp": when, "origin": {"kind": "human"},
+             "message": {"role": "user", "content": text}}]
+
+
+class CurrentSessionTest(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.env = {**ENV, "HOME": self.home.name}
+        self.work = Path(self.home.name) / "work"
+        self.work.mkdir()
+        projects = Path(self.home.name) / ".claude" / "projects" / "-work"
+        self.mine = write_log(projects, "aaaa1111.jsonl", claude_log(str(self.work), "我這個視窗"))
+        self.other = write_log(projects, "bbbb2222.jsonl", claude_log(str(self.work), "另一個視窗"))
+        os.utime(self.mine, (1, 1))  # the other window was updated more recently
+
+    def tearDown(self):
+        self.home.cleanup()
+
+    def test_uses_the_session_id_claude_code_provides(self):
+        env = {**self.env, "CLAUDE_CODE_SESSION_ID": "aaaa1111"}
+        digest = run_digest("current", extra=("--cwd", self.work), env=env)
+        self.assertIn("我這個視窗", digest)
+        self.assertNotIn("另一個視窗", digest)
+
+    def test_without_session_id_it_asks_instead_of_guessing(self):
+        done = run_script("digest", "current", "--cwd", self.work, "--out", Path(self.home.name) / "d.md", env=self.env)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("aaaa1111", done.stderr)
+        self.assertIn("bbbb2222", done.stderr)
+
+
+def codex_meta_record(session, cwd="/tmp/proj", parent=None):
+    source = {"subagent": {"thread_spawn": {"parent_thread_id": parent}}} if parent else "cli"
+    return codex("session_meta", {"id": session, "cwd": cwd, "cli_version": "0.150.0", "source": source})
+
+
+class CodexPrivacyTest(unittest.TestCase):
+    def test_single_file_does_not_open_other_days_logs(self):
+        with tempfile.TemporaryDirectory() as home:
+            day = Path(home) / ".codex" / "sessions" / "2026" / "10" / "13"
+            parent_id = "019e0000-aaaa-7000-8000-00000000000a"
+            target = write_log(day, f"rollout-2026-10-13T01-00-00-{parent_id}.jsonl",
+                               [codex_meta_record(parent_id), codex_user("幫我修")])
+            write_log(day, "rollout-2026-10-13T01-05-00-019e0000-aaaa-7000-8000-00000000000b.jsonl",
+                      [codex_meta_record("019e0000-aaaa-7000-8000-00000000000b", parent=parent_id)])
+            locked = write_log(Path(home) / ".codex" / "sessions" / "2026" / "09" / "01",
+                               "rollout-2026-09-01T01-00-00-019e0000-aaaa-7000-8000-00000000000c.jsonl",
+                               [codex_meta_record("019e0000-aaaa-7000-8000-00000000000c", parent=parent_id)])
+            locked.chmod(0)
+            try:
+                digest = run_digest(target, env={**ENV, "HOME": home})
+            finally:
+                locked.chmod(0o600)
+        self.assertIn("00000000000b", digest)  # helper agent from the same day is still found
+        self.assertNotIn("00000000000c", digest)
+
+
+class ProjectFilterTest(unittest.TestCase):
+    def test_chinese_keyword_does_not_match_everything(self):
+        self.assertFalse(cs.project_matches("堰塞湖", "/work/payroll-private"))
+        self.assertFalse(cs.project_matches("！！", "/work/payroll-private"))
+        self.assertTrue(cs.project_matches("堰塞湖", "/work/堰塞湖研究"))
+        self.assertTrue(cs.project_matches("my_app", "-Users-me-my-app"))
+
+
+SECRET = "Bearer eyJhbGciOiJIUzI1NiJ9.abc.def"
+
+
+class RedactEverywhereTest(unittest.TestCase):
+    def test_no_secret_reaches_digest_or_list(self):
+        records = [
+            codex_meta_record("019e0000-aaaa-7000-8000-0000000000d1"),
+            codex_user(f"幫我呼叫 API，header 是 {SECRET}"),
+            codex("response_item", {"type": "function_call", "name": "exec_command", "call_id": "c1",
+                                    "arguments": json.dumps({"cmd": "curl x", "justification": f"use {SECRET}"})}),
+            codex("event_msg", {"type": "turn_aborted", "reason": f"stopped {SECRET}"}),
+        ]
+        omp = [OMP_RECORDS[0], omp_message({"role": "assistant", "stopReason": "toolUse", "content": [
+            {"type": "toolCall", "id": "t1", "name": "bash", "intent": f"call with {SECRET}", "arguments": {"command": "ls"}}]})]
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_path = write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000d1.jsonl", records)
+            omp_path = write_log(tmp, "o/2026_01a0dddd.jsonl", omp)
+            digest = run_digest(codex_path, omp_path)
+            title = cs.summarize_session(codex_path)["title"]
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", digest)
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", title)
+
+
+# ---------------------------------------------------------------- group 2: keep the evidence
+
+def claude_tool(tool_id, command, result, is_error=False):
+    return [tool_use(tool_id, "Bash", {"command": command}),
+            {"type": "user", "timestamp": "2026-10-13T01:01:30Z",
+             "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id,
+                                                      "content": result, "is_error": is_error}]}}]
+
+
+class EvidenceTest(unittest.TestCase):
+    def test_passing_check_output_is_kept(self):
+        records = RECORDS[:1] + claude_tool("t1", "pytest -q", "lots of dots\n" * 50 + "17 passed in 0.3s") \
+            + claude_tool("t2", "ls", "a.txt")
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "ev.jsonl", records))
+        self.assertIn("17 passed", digest)
+        self.assertIn("成功，輸出未列出", digest)  # the ls result is omitted, but visibly so
+
+    def test_codex_exit_status_variants(self):
+        failing = [
+            {"output": json.dumps({"exit_code": 2, "output": "1 failed"})},
+            {"output": json.dumps({"output": "boom", "metadata": {"exit_code": -1}})},
+            {"output": [{"type": "input_text", "text": json.dumps({"exit_code": 1, "output": "x"})}]},
+            {"output": json.dumps({"isError": True, "output": "bad"})},
+            {"output": "Process exited with code -9\nOutput:\nkilled"},
+        ]
+        for payload in failing:
+            with self.subTest(payload=payload):
+                self.assertEqual(src.codex_output(payload)[1], "error")
+        self.assertEqual(src.codex_output({"output": "Process exited with code 0\nOutput:\nok"})[1], "ok")
+        self.assertEqual(src.codex_output({"output": "just text"}, shell=True)[1], "unknown")
+
+    def test_codex_code_mode_keeps_non_shell_steps(self):
+        code = ('await tools.exec_command({cmd: "pytest"});\n'
+                'await tools.apply_patch("*** Begin Patch\\n*** Delete File: report.md\\n*** End Patch");')
+        records = [codex_meta_record("019e0000-aaaa-7000-8000-0000000000e1"), codex_user("修"),
+                   codex("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input": code})]
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000e1.jsonl", records))
+        self.assertIn("`pytest`", digest)
+        self.assertIn("report.md", digest)
+
+    def test_rejection_reason_counts_as_correction(self):
+        reason = ("The user doesn't want to proceed with this tool use. The tool use was rejected. "
+                  "To tell you how to proceed, the user said:\n不要推送，先給我看")
+        records = RECORDS[:1] + claude_log("/tmp/proj", "幫我推") + claude_tool("t1", "git push", reason, is_error=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "rej.jsonl", records))
+        signals = digest.split("---")[0]
+        self.assertIn("使用者拒絕並說明：不要推送，先給我看", signals)
+
+    def test_user_repeating_after_interrupt_is_not_a_retry(self):
+        said = omp_message({"role": "user", "attribution": "user", "content": "不要發布"})
+        aborted = omp_message({"role": "assistant", "stopReason": "aborted", "content": []})
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "o/2026_01a0eeee.jsonl", OMP_RECORDS[:1] + [said, aborted, said]))
+        self.assertIn("使用者發言 2 輪", digest)
+        self.assertNotIn("自動重試", digest)
+
+
+# ---------------------------------------------------------------- group 3: workflow and scale
+
+class OmpRulesTest(unittest.TestCase):
+    def test_injected_rules_do_not_hide_unknown_instruction_files(self):
+        records = OMP_RECORDS[:1] + [{"type": "ttsr_injection", "timestamp": "2026-10-13T02:00:01Z",
+                                      "injectedRules": ["no-force-push"]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "o/2026_01a0ffff.jsonl", records))
+        self.assertIn("OMP 不會在紀錄裡寫下載入了哪些指示檔", digest)
+        self.assertIn("臨時套用的規則", digest)
+        self.assertIn("no-force-push", digest)
+
+
+class SinceTest(unittest.TestCase):
+    def test_since_keeps_original_turn_numbers(self):
+        records = (claude_log("/tmp/proj", "第一句", "2026-10-13T01:00:00Z")
+                   + claude_log("/tmp/proj", "第二句", "2026-10-13T03:00:00Z"))
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "since.jsonl", records), extra=("--since", "2026-10-13T02:00:00Z"))
+        self.assertNotIn("第一句", digest)
+        self.assertIn("【使用者 #2】", digest)
+        self.assertIn("已省略", digest)
+
+    def test_first_timestamp_reads_only_the_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_log(tmp, "head.jsonl", claude_log("/tmp/proj", "x", "2026-10-13T05:00:00Z"))
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write("{broken json that must never be parsed\n")
+            self.assertEqual(src.first_timestamp(path), "2026-10-13T05:00:00Z")
 
 
 if __name__ == "__main__":

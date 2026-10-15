@@ -16,6 +16,7 @@ corrections, and shell commands written in a way that can hide a failure. The si
 """
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -80,8 +81,11 @@ URL_CREDENTIALS = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@", re.
 BEARER_TOKEN = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 TOOL_INPUT_LIMIT = 300
 COMMAND_LIMIT = 600
+CODE_LIMIT = 1500
 TOOL_RESULT_LIMIT = 400
 ERROR_RESULT_LIMIT = 1200
+# Claude Code writes this when the person rejects a tool call and types a reason.
+REJECTION_REASON = re.compile(r"the user said:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
 
 def redact(text):
@@ -100,22 +104,51 @@ def clip(text, limit):
     return text[:limit] + f" …〔已截斷，原長 {len(text)} 字〕"
 
 
-def current_session(cwd, source):
-    """Most recently modified session of one tool whose recorded working directory is cwd.
+def clip_end(text, limit):
+    """Keep the end of a long output, where test runners print their verdict."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return f"〔前面 {len(text) - limit} 字已省略〕… " + text[-limit:]
 
-    Claude Code and OMP name project folders by rewriting the path, so the folder
-    name cannot be rebuilt reliably (underscores, dots, spaces, non-ASCII).
-    Match on the recorded cwd instead.
+
+def safe(text, limit, keep_end=False):
+    """Mask secrets first, then shorten, so a cut can never leave half a secret unmasked."""
+    masked = redact(str(text))
+    return clip_end(masked, limit) if keep_end else clip(masked, limit)
+
+
+def current_session(cwd, source):
+    """The session this command is running inside.
+
+    Claude Code tells its child processes the session ID (CLAUDE_CODE_SESSION_ID),
+    so that log is used directly. Without it, sessions are matched on their
+    recorded working directory (folder names are rewritten paths and cannot be
+    rebuilt reliably). If more than one matches, ask instead of guessing: another
+    window in the same folder may have been updated more recently.
     """
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if source == "claude" and session:
+        matches = [path for _, path in src.find_by_id(session, ["claude"]) if path.stem == session]
+        if len(matches) == 1:
+            return source, matches[0]
     target = str(Path(cwd).expanduser().resolve())
-    logs = sorted(src.all_logs(source), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in logs:
+    found = []
+    for path in src.all_logs(source):
         if source == "codex" and src.is_codex_subagent(path):
             continue
         recorded = src.log_cwd(path)
         if recorded and str(Path(recorded).resolve()) == target:
-            return source, path
-    sys.exit(f"找不到工作目錄是 {target} 的 {src.TOOL_NAMES[source]} session。請改給 session ID，或先用 list 查。")
+            found.append(path)
+    if len(found) == 1:
+        return source, found[0]
+    if not found:
+        sys.exit(f"找不到工作目錄是 {target} 的 {src.TOOL_NAMES[source]} session。請改給 session ID，或先用 list 查。")
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    rows = "\n".join(f"  - {src.session_id(p, source)}（最後更新 {datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}）"
+                     for p in found[:10])
+    sys.exit(f"這個資料夾有 {len(found)} 個 {src.TOOL_NAMES[source]} session，無法確定是哪一個，"
+             f"請指定 session ID：\n{rows}")
 
 
 def resolve_session(target, cwd=None, source="auto"):
@@ -135,16 +168,18 @@ def resolve_session(target, cwd=None, source="auto"):
 
 
 def tool_brief(payload):
-    """One-line view of a tool call; shell commands are shown verbatim."""
+    """One-line view of a tool call; shell commands and scripts are shown verbatim (masked)."""
     command = payload.get("command")
     if command:
-        brief = f"`{clip(redact(str(command)), COMMAND_LIMIT)}`"
+        brief = f"`{safe(command, COMMAND_LIMIT)}`"
         if payload.get("description"):
-            brief += f"（{clip(str(payload['description']), 80)}）"
+            brief += f"（{safe(payload['description'], 80)}）"
         return brief
+    if payload.get("code"):
+        return f"{safe(payload.get('description') or '程式內容', 200)}\n\n```\n{safe(payload['code'], CODE_LIMIT)}\n```"
     detail = (payload.get("file_path") or payload.get("path") or payload.get("description")
               or payload.get("prompt") or json.dumps(payload, ensure_ascii=False))
-    return clip(redact(str(detail)), TOOL_INPUT_LIMIT)
+    return safe(detail, TOOL_INPUT_LIMIT)
 
 
 def summarize_session(path, source=None):
@@ -153,21 +188,29 @@ def summarize_session(path, source=None):
     return {
         "source": log.source,
         "id": log.id,
-        "project": src.project_label(path, log.source),
+        "project": redact(src.project_label(path, log.source)),
         "started": fmt_day(log.first_timestamp()),
         "modified": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
         "size_mb": path.stat().st_size / 1_000_000,
         "user_turns": len(typed),
         # Same rule as the digest: the opening message is never counted as a correction.
         "hint_turns": sum(1 for e in typed[1:] if CORRECTION_HINTS.search(e.text)),
-        "title": clip(log.title or (typed[0].text if typed else ""), 60).replace("\n", " ").replace("|", "／"),
+        "title": safe(log.title or (typed[0].text if typed else ""), 60).replace("\n", " ").replace("|", "／"),
     }
 
 
 def project_matches(keyword, label):
-    """Keyword match that ignores how each tool rewrites paths (Claude Code turns "_" and "/" into "-")."""
-    loose = lambda text: re.sub(r"[^0-9a-z]+", "-", text.lower())
-    return keyword.lower() in label.lower() or loose(keyword) in loose(label)
+    """Keyword match that ignores how each tool rewrites paths (Claude Code turns "_" and "/" into "-").
+
+    Only separators are loosened; letters in any language are kept, so a Chinese
+    keyword is never reduced to "-" and matched against every path.
+    """
+    keyword, label = keyword.lower(), label.lower()
+    if keyword in label:
+        return True
+    loose = lambda text: re.sub(r"[\W_]+", "-", text).strip("-")
+    pattern = loose(keyword)
+    return bool(pattern) and pattern in loose(label)
 
 
 def candidate_logs(source, keyword):
@@ -184,7 +227,8 @@ def candidate_logs(source, keyword):
                 continue
             found.append((name, path))
     if keyword and not found:
-        sys.exit(f"找不到專案名稱或資料夾含「{keyword}」的 session")
+        sys.exit(f"找不到專案名稱或資料夾含「{keyword}」的 session。"
+                 "Claude Code 的專案資料夾名稱裡只留英文和數字，中文關鍵字比對不到；請改用路徑裡的英文部分，或直接給資料夾路徑。")
     return sorted(found, key=lambda item: item[1].stat().st_mtime, reverse=True)
 
 
@@ -205,6 +249,17 @@ def cmd_list(args):
               f"{s['size_mb']:.1f} MB | {s['user_turns']} | {s['hint_turns']} | {s['title']} |")
 
 
+def parse_time(stamp):
+    """Aware datetime for an ISO timestamp, or for "YYYY-MM-DD HH:MM" in local time; None if unreadable."""
+    if not stamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.astimezone()
+
+
 def fmt_day(stamp):
     if not stamp:
         return "?"
@@ -214,27 +269,47 @@ def fmt_day(stamp):
         return stamp[:16]
 
 
-def digest_one(log, tag, keep_results):
+def result_line(event, command, keep_results):
+    """How one successful or unknown result appears in the digest."""
+    text = redact(event.text)
+    if event.status == "unknown":
+        return f"  - ❔ 結束狀態不明（{event.name}）：{clip_end(text, TOOL_RESULT_LIMIT)}"
+    if keep_results:
+        return f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}"
+    if CHECK_COMMAND.search(command):
+        return f"  - ↳ 檢查結果（結尾）：{clip_end(text, TOOL_RESULT_LIMIT)}"
+    return f"  - ↳ 成功，輸出未列出（{len(text)} 字）"
+
+
+def digest_one(log, tag, keep_results, since=None):
     lines, signals = [], []
     turn = 0
-    errors = swallows = loose_swallows = 0
+    errors = swallows = loose_swallows = rejections = skipped = 0
     agent = log.agent
+    commands = {}  # call id -> shell command, to judge its result
 
     for event in log.events:
+        if event.kind == "user":
+            turn += 1  # counted even when hidden by --since, so turn numbers match the full digest
+        if event.kind == "tool" and event.call_id:
+            commands[event.call_id] = str(event.payload.get("command") or event.payload.get("code") or "")
+        moment = parse_time(event.when)
+        if since and (moment is None or moment < since):
+            skipped += 1
+            continue
         when = fmt_day(event.when) if event.when else "--"
         if event.kind == "note":
             lines.append(f"- ⌨ {clip(redact(event.text), TOOL_INPUT_LIMIT)}")
         elif event.kind == "compact":
             lines.append(f"\n> 〔{when} 對話在這裡被壓縮（compact），之前的內容由系統摘要取代〕\n")
         elif event.kind == "interrupt":
-            signals.append(f"- {tag}{when} 使用者中斷了 {agent}" + (f"（{event.text}）" if event.text else ""))
+            signals.append(f"- {tag}{when} 使用者中斷了 {agent}" + (f"（{safe(event.text, 150)}）" if event.text else ""))
             lines.append(f"- ⏹ 使用者在這裡中斷了 {agent}")
         elif event.kind == "api_error":
             times = f"（連續 {event.repeat} 次）" if event.repeat > 1 else ""
             signals.append(f"- {tag}{when} 模型或連線錯誤{times}：{clip(redact(event.text), 150)}")
             lines.append(f"  - ❌ 模型或連線錯誤{times}：{clip(redact(event.text), ERROR_RESULT_LIMIT)}")
         elif event.kind == "user":
-            turn += 1
             text = redact(event.text)
             flag = " ⚑疑似糾正" if CORRECTION_HINTS.search(text) and turn > 1 else ""
             if flag:
@@ -260,15 +335,23 @@ def digest_one(log, tag, keep_results):
                 lines.append(f"  - ⚠ 檢查結果可能被吞掉：{found}")
         elif event.kind == "result":
             text = redact(event.text)
-            if event.is_error:
-                lowered = text.lower()
-                denied = "denied" in lowered or "rejected" in lowered or "拒絕" in text
-                label = "⛔ 被拒絕" if denied else "❌ 錯誤"
-                errors += 1
-                signals.append(f"- {tag}{when} {event.name} {label}：{clip(text, 150)}")
-                lines.append(f"  - {label}（{event.name}）：{clip(text, ERROR_RESULT_LIMIT)}")
-            elif keep_results:
-                lines.append(f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}")
+            if event.status != "error":
+                lines.append(result_line(event, commands.get(event.call_id, ""), keep_results))
+                continue
+            errors += 1
+            reason = REJECTION_REASON.search(text)
+            lowered = text.lower()
+            if reason and reason.group(1).strip():
+                # The person stopped this action and said why: a direct correction.
+                rejections += 1
+                said = reason.group(1).strip()
+                signals.append(f"- {tag}{when} {event.name} ⛔ 使用者拒絕並說明：{clip(said, 200)}")
+                lines.append(f"  - ⛔ 使用者拒絕並說明（{event.name}）：{clip(said, ERROR_RESULT_LIMIT)}")
+                continue
+            denied = "denied" in lowered or "rejected" in lowered or "拒絕" in text
+            label = "⛔ 被拒絕" if denied else "❌ 錯誤"
+            signals.append(f"- {tag}{when} {event.name} {label}：{clip(text, 150)}")
+            lines.append(f"  - {label}（{event.name}）：{clip(text, ERROR_RESULT_LIMIT)}")
 
     header = [
         f"## {tag}Session {log.id}",
@@ -277,34 +360,48 @@ def digest_one(log, tag, keep_results):
         f"- 工作目錄：`{log.cwd}`",
         f"- 工具：{log.tool}，版本 {log.version}；模型：{', '.join(sorted(m for m in log.models if m))}",
         f"- 權限模式：{', '.join(sorted(p for p in log.permission if p)) or '未記錄'}",
-        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次；檢查結果可能被吞掉的指令 {swallows} 次",
+        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次（其中使用者拒絕並說明理由 {rejections} 次）；檢查結果可能被吞掉的指令 {swallows} 次",
         f"- 另有 {loose_swallows} 個指令用了 `| head`、`2>/dev/null` 等寫法，多半只是縮短輸出，未逐一列出；診斷時可視需要 grep 原始紀錄",
     ]
+    if since:
+        header.append(f"- 只看 {since.astimezone():%Y-%m-%d %H:%M} 之後：之前的 {skipped} 則事件已省略，輪次編號仍與完整摘要相同")
+        lines.insert(0, f"\n> 〔{since.astimezone():%Y-%m-%d %H:%M} 之前的 {skipped} 則事件已省略〕\n")
     if log.instructions:
         header.append("- 載入的指示檔（依紀錄，出現順序）：")
         header += [f"  - `{item}`" for item in log.instructions]
     else:
         header.append(f"- 載入的指示檔：{log.missing_instructions}")
+    if log.injected_rules:
+        header.append("- 臨時套用的規則（工具在對話中途注入的規則名稱，不是檔案路徑）：" + "、".join(log.injected_rules))
     if log.subagent_logs:
         header.append(f"- 另有 {len(log.subagent_logs)} 份 subagent 紀錄（可用同一支腳本另做摘要）：")
         header += [f"  - `{sub}`" for sub in log.subagent_logs]
+    if log.source == "codex":
+        header.append("- Codex 的小助手紀錄只在同一天的資料夾裡找；跨過午夜才開始的小助手不會列出")
     return header, lines, signals, turn
 
 
 def cmd_digest(args):
+    since = parse_time(args.since) if args.since else None
+    if args.since and since is None:
+        sys.exit(f"看不懂 --since 的時間：{args.since}（請用 2026-10-13 14:30 這種格式，代表本機時間）")
     targets = list(dict.fromkeys(resolve_session(t, args.cwd, args.source) for t in args.targets))
-    logs = sorted((src.read_session(path, source) for source, path in targets), key=lambda log: log.first_timestamp())
-    multi = len(logs) > 1
-    headers, bodies, all_signals, total_turns = [], [], [], 0
-    for index, log in enumerate(logs, 1):
+    # Order by the first timestamp, read from the head of each file; then read one log at a time.
+    targets.sort(key=lambda item: src.first_timestamp(item[1]))
+    multi = len(targets) > 1
+    headers, bodies, all_signals, total_turns, title_ids = [], [], [], 0, []
+    for index, (source, path) in enumerate(targets, 1):
+        log = src.read_session(path, source)
         tag = f"S{index} " if multi else ""
-        header, lines, signals, turns = digest_one(log, tag, args.results)
+        header, lines, signals, turns = digest_one(log, tag, args.results, since)
         headers += header + [""]
         bodies += [f"\n# {tag}時序：{log.tool} {log.id}（開始於 {fmt_day(log.first_timestamp())}）"] + lines
         all_signals += signals
         total_turns += turns
+        title_ids.append(f"{log.tool} {log.id}")
+        del log
 
-    title = f"# 對話摘要：{len(logs)} 個 session（依開始時間排序）" if multi else f"# Session 摘要：{logs[0].tool} {logs[0].id}"
+    title = f"# 對話摘要：{len(targets)} 個 session（依開始時間排序）" if multi else f"# Session 摘要：{title_ids[0]}"
     doc = [title, ""]
     if multi:
         doc += ["同一件工作被重開成多個 session，依時間串起來讀。編號 S1、S2… 對應下方各段。", ""]
@@ -315,11 +412,13 @@ def cmd_digest(args):
 
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(doc) + "\n", encoding="utf-8")
+    # Final pass over everything written: any field that skipped masking above is masked here.
+    out.write_text(redact("\n".join(doc)) + "\n", encoding="utf-8")
     size_kb = out.stat().st_size / 1000
-    print(f"已寫入 {out}（{size_kb:.0f} KB，{len(logs)} 個 session，使用者 {total_turns} 輪，訊號 {len(all_signals)} 則）")
+    print(f"已寫入 {out}（{size_kb:.0f} KB，{len(targets)} 個 session，使用者 {total_turns} 輪，訊號 {len(all_signals)} 則）")
     if size_kb > LARGE_DIGEST_KB:
-        print(f"注意：摘要超過 {LARGE_DIGEST_KB} KB，完整讀完會用掉較多額度與時間。", file=sys.stderr)
+        print(f"注意：摘要超過 {LARGE_DIGEST_KB} KB，完整讀完會用掉較多額度與時間。"
+              "可以加 --since \"YYYY-MM-DD HH:MM\" 只看某個時間之後。", file=sys.stderr)
 
 
 def main():
@@ -333,7 +432,9 @@ def main():
     p_digest = sub.add_parser("digest", help="把一個或多個 session 壓成一份摘要")
     p_digest.add_argument("targets", nargs="+", help="session ID（可只給前幾碼）、.jsonl 路徑，或 current；可給多個，可混用不同工具")
     p_digest.add_argument("--out", required=True, help="摘要輸出路徑")
-    p_digest.add_argument("--results", action="store_true", help="也保留成功的工具結果（摘要會變大）")
+    p_digest.add_argument("--results", action="store_true",
+                          help="保留所有成功工具結果的開頭（預設只保留測試、建置等檢查指令結果的結尾）")
+    p_digest.add_argument("--since", help="只看這個時間之後，例如 \"2026-10-13 14:30\"（本機時間）或 ISO 時間；輪次編號不變")
     p_digest.add_argument("--cwd", help="搭配 current 使用：指定工作目錄（預設為目前所在資料夾）")
     p_digest.add_argument("--source", choices=("auto",) + src.SOURCES, default="auto",
                           help="紀錄來自哪個工具；auto 會從檔案內容判斷、ID 會在三個工具的資料夾都找。current 搭配 auto 時視為 Claude Code")
