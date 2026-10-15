@@ -475,64 +475,102 @@ def codex_json(text: str):
     return parsed if isinstance(parsed, dict) else None
 
 
-def result_fields(obj, depth: int = 0):
-    """(exit codes, error flags, running process IDs) found in a tool-result structure.
+JSON_DECODER = json.JSONDecoder()
+# A failed parse can read far ahead (deeply nested, never closed), so stop after a few;
+# the result is then "unknown" rather than read as success.
+MAX_JSON_FAILURES = 20
 
-    Follows "output" into nested results (a JSON string or object), a few levels deep.
+
+def result_fields(obj, depth: int = 0):
+    """(exit codes, error flags, running process IDs) of one tool-result structure.
+
+    When the structure reports its own exit code, its "output" is the command's
+    stdout and may contain anything, so it is not read as a status. Only a bare
+    wrapper (no exit code of its own) is followed into its "output".
     """
     codes, errors, running = [], [], []
     if not isinstance(obj, dict) or depth > 3:
         return codes, errors, running
-    code = obj.get("exit_code", (obj.get("metadata") or {}).get("exit_code") if isinstance(obj.get("metadata"), dict) else None)
+    metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
+    code = obj.get("exit_code", metadata.get("exit_code"))
     if isinstance(code, int):
         codes.append(code)
     if obj.get("isError") or obj.get("is_error"):
         errors.append(True)
     if obj.get("session_id") is not None and code is None:
         running.append(str(obj["session_id"]))
-    inner = obj.get("output")
-    if isinstance(inner, str):
-        inner = codex_json(inner)
-    for found, extra in zip((codes, errors, running), result_fields(inner, depth + 1)):
-        found += extra
+    if code is None:
+        inner = obj.get("output")
+        if isinstance(inner, str):
+            inner = codex_json(inner)
+        for found, extra in zip((codes, errors, running), result_fields(inner, depth + 1)):
+            found += extra
     return codes, errors, running
 
 
+LINE_START_BRACE = re.compile(r"^[ \t]*\{", re.MULTILINE)
+
+
+def json_blocks(text: str):
+    """(position, object) for each JSON object that starts a line, including multi-line ones,
+    plus how many "{" lines could not be parsed. One pass over the text."""
+    blocks, unparsed, pos = [], 0, 0
+    for match in LINE_START_BRACE.finditer(text):
+        brace = match.end() - 1
+        if brace < pos:  # inside an object already read
+            continue
+        if unparsed >= MAX_JSON_FAILURES:
+            break
+        try:
+            obj, end = JSON_DECODER.raw_decode(text, brace)
+        except (ValueError, RecursionError):
+            unparsed += 1
+            continue
+        if isinstance(obj, dict):
+            blocks.append((brace, obj))
+        pos = end
+    return blocks, unparsed
+
+
 def codex_result_facts(text: str, code_mode: bool):
-    """Exit codes, error flags and running process IDs reported for a Codex tool call.
+    """Exit codes, error flags, running process IDs (in the order reported) and whether some
+    result could not be read, for one Codex tool call.
 
     A direct shell call reports its status in a header before "Output:"; what comes
     after is the command's own stdout, which may contain anything (a test fixture
     with "exit_code": 1), so it is not read. A code-mode script prints one result
-    per step, so every line is read.
+    per step, so the whole output is read, including results spread over several lines.
     """
     parsed = codex_json(text)
     if parsed is not None:
-        return result_fields(parsed)
+        codes, errors, running = result_fields(parsed)
+        return codes, errors, running, False
     region = text if code_mode else text.split("\nOutput:", 1)[0]
-    codes = [int(a or b) for a, b in CODEX_EXIT.findall(region)]
-    running = CODEX_RUNNING.findall(region)
-    errors = []
-    for line in region.splitlines():
-        found = codex_json(line.strip())
-        if found is not None:
-            more = result_fields(found)
-            codes += more[0]
-            errors += more[1]
-            running += more[2]
-    return codes, errors, running
+    codes, errors, ordered = [], [], []
+    for match in CODEX_EXIT.finditer(region):
+        codes.append(int(match.group(1) or match.group(2)))
+    for match in CODEX_RUNNING.finditer(region):
+        ordered.append((match.start(), match.group(1)))
+    blocks, unparsed = json_blocks(region)
+    for position, obj in blocks:
+        more = result_fields(obj)
+        codes += more[0]
+        errors += more[1]
+        ordered += [(position, process) for process in more[2]]
+    running = [process for _, process in sorted(ordered)]
+    return codes, errors, running, unparsed > 0
 
 
 def codex_output(payload: dict, shell: bool = False, code_mode: bool = False):
     """(text, status) for a Codex tool output record: "ok", "error", "running" or "unknown".
 
-    Any failing step fails the call, even when an outer wrapper reports success, and a
-    failure is never hidden behind "still running". Shell results whose exit status
-    cannot be found are "unknown", never assumed to have worked.
+    Any failing step fails the call, and a failure is never hidden behind "still
+    running". Shell results whose exit status cannot be found, and scripts with a
+    result that could not be read, are "unknown", never assumed to have worked.
     """
     text = block_text(payload.get("output"))
     code_mode = code_mode or text.lstrip().startswith(("Script completed", "Script error"))
-    codes, errors, running = codex_result_facts(text, code_mode)
+    codes, errors, running, unreadable = codex_result_facts(text, code_mode)
     parsed = codex_json(text)
     if parsed is not None and "output" in parsed:
         inner = parsed["output"]
@@ -543,13 +581,13 @@ def codex_output(payload: dict, shell: bool = False, code_mode: bool = False):
         return text, "error"
     if running and not codes:
         return text, "running"
-    if shell and not codes:
+    if (shell and not codes) or unreadable:
         return text, "unknown"
     return text, "ok"
 
 
 def running_ids(payload: dict) -> list:
-    """Process IDs a Codex result says are still running, in the order reported."""
+    """Process IDs a Codex result says are still running, in the order they appear."""
     text = block_text(payload.get("output"))
     code_mode = text.lstrip().startswith(("Script completed", "Script error"))
     return list(dict.fromkeys(codex_result_facts(text, code_mode)[2]))

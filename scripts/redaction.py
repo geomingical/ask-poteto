@@ -26,21 +26,21 @@ SPOKEN_PASSWORD = re.compile(r"(?i)\b(password|passwd)(\s+(?:is|=)\s+)\S+|(密�
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 KEY_BODY_LINE = re.compile(r"[A-Za-z0-9+/=]+")  # base64, including a short last line such as "AAAA=="
-KEY_HEADER_LINE = re.compile(r"[A-Za-z-]+: .*")  # Proc-Type / DEK-Info in an encrypted key
+# One line after a BEGIN marker: base64, an encrypted-key header (Proc-Type, DEK-Info) or blank.
+# Matched from a position, so a line that is not key material is rejected at its first odd character.
+KEY_LINE_AT = re.compile(r"[ \t]*(?:([A-Za-z0-9+/=]+)|([A-Za-z-]+: [^\n]*))?[ \t]*(?:\n|\Z)")
 
 
 def lines_after(text, pos):
     """End of the key lines that follow pos (header, blank and base64 lines)."""
     end = pos
     while pos < len(text):
-        newline = text.find("\n", pos)
-        stop = len(text) if newline == -1 else newline
-        line = text[pos:stop].strip()
-        if line and not (KEY_BODY_LINE.fullmatch(line) or KEY_HEADER_LINE.fullmatch(line)):
+        line = KEY_LINE_AT.match(text, pos)
+        if not line or line.end() == pos:
             break
-        if line:
-            end = stop
-        pos = stop + 1
+        if line.group(1) or line.group(2):
+            end = line.end(1) if line.group(1) else line.end(2)
+        pos = line.end()
     return end
 
 
@@ -86,7 +86,8 @@ def mask_private_keys(text):
 
 # ---------------------------------------------------------------- credentials in URLs
 
-URL_USERINFO = re.compile(r"[^\s/?#@]*")
+URL_USER = re.compile(r"[^\s:/@]*")
+URL_PASSWORD = re.compile(r"[^\s/@]*")  # unencoded ? and # do appear in passwords in error logs
 
 
 def mask_url_credentials(text):
@@ -96,13 +97,15 @@ def mask_url_credentials(text):
         found = text.find("://", pos)
         if found == -1:
             break
-        userinfo = URL_USERINFO.match(text, found + 3)
-        end = userinfo.end()
-        colon = text.find(":", found + 3, end)
-        if end < len(text) and text[end] == "@" and colon != -1:
-            pieces += [text[start:colon + 1], MASK]
-            start = end
-        pos = max(end, found + 3)
+        user = URL_USER.match(text, found + 3)
+        pos = user.end()
+        if pos < len(text) and text[pos] == ":":
+            password = URL_PASSWORD.match(text, pos + 1)
+            if password.end() < len(text) and text[password.end()] == "@":
+                pieces += [text[start:pos + 1], MASK]
+                start = password.end()
+            pos = password.end()
+        pos = max(pos, found + 3)
     return "".join(pieces) + text[start:]
 
 # ---------------------------------------------------------------- name = value
@@ -110,9 +113,12 @@ def mask_url_credentials(text):
 # A secret-looking keyword inside a name: OPENAI_API_KEY, apiKey, --password, ?token=.
 SECRET_KEYWORD = re.compile(r"api_?key|apikey|key|token|secret|password|passwd|pwd", re.IGNORECASE)
 NAME_CHARS = re.compile(r"[A-Za-z0-9_.-]*")
-SEPARATOR = re.compile(r"""["']?[ \t]*(?::=|[=:：])[ \t]*["']?""")
+# "=" or ":" (or ":="), optionally after a closing quote; a YAML value may sit on the next line.
+SEPARATOR = re.compile(r"""["']?[ \t]*(?::=|[=:：])\s*""")
 OPTION_SEPARATOR = re.compile(r"[ \t]+")
-VALUE = re.compile(r"""[^\s,;"'&]+""")
+QUOTED_VALUE = {'"': re.compile(r'"[^"\n]*"'), "'": re.compile(r"'[^'\n]*'")}
+VALUE = re.compile(r"[^\s,;]+")
+QUERY_VALUE = re.compile(r"[^\s&]+")  # ?token=...&next=... : "&" ends the value only in a URL query
 
 
 def keyword_is_a_name_part(text, start, end):
@@ -137,29 +143,55 @@ def name_start(text, pos, limit=64):
     return pos
 
 
+def value_end(text, pos, in_query):
+    """End of the value starting at pos: up to a space (or "&" in a URL query), and further
+    when it opens a quoted string that contains spaces. Whichever reaches further wins, so
+    neither "'a'secret" nor "\"a b\"" leaves part of the value unmasked."""
+    found = (QUERY_VALUE if in_query else VALUE).match(text, pos)
+    end = found.end() if found else pos
+    quote = QUOTED_VALUE.get(text[pos:pos + 1])
+    if quote:
+        quoted = quote.match(text, pos)
+        if quoted:
+            end = max(end, quoted.end())
+    return end
+
+
 def mask_assignments(text):
-    """Mask the value after a secret-looking name and "=" or ":" (or after a --secret-option)."""
+    """Mask the value after a secret-looking name and "=" or ":" (or after a --secret-option).
+
+    Every keyword in a name is tried ("MONKEY_API_KEY": "KEY" in MONKEY fails, API_KEY
+    counts). The end of the name is worked out once per name and reused, so a long name
+    full of keywords is still read only once.
+    """
     pieces, start, pos = [], 0, 0
+    run_start, run_end = -1, -1  # the name the last keyword was found in
     while True:
         keyword = SECRET_KEYWORD.search(text, pos)
         if not keyword:
             break
-        name_end = NAME_CHARS.match(text, keyword.end()).end()
-        pos = max(name_end, keyword.end())
+        pos = keyword.end()
+        if not run_start <= keyword.start() < run_end:
+            run_start, run_end = keyword.start(), NAME_CHARS.match(text, keyword.end()).end()
         if not keyword_is_a_name_part(text, keyword.start(), keyword.end()):
             continue
+        name_end = run_end
         separator = SEPARATOR.match(text, name_end)
         if not separator or separator.end() == name_end:
             # "--api-key VALUE": a command-line option takes its value after a space.
             option = text.startswith("--", name_start(text, keyword.start()))
             separator = OPTION_SEPARATOR.match(text, name_end) if option else None
         if not separator or separator.end() == name_end:
+            pos = max(pos, name_end)
             continue
-        value = VALUE.match(text, separator.end())
-        if not value or value.end() == separator.end():
+        begin = name_start(text, keyword.start())
+        in_query = begin > 0 and text[begin - 1] in "?&"
+        end = value_end(text, separator.end(), in_query)
+        if end == separator.end():
+            pos = max(pos, name_end)
             continue
         pieces += [text[start:separator.end()], MASK]
-        start = pos = value.end()
+        start = pos = end
     return "".join(pieces) + text[start:]
 
 

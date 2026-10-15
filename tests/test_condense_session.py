@@ -593,7 +593,7 @@ class ThirdReviewTest(unittest.TestCase):
             "Process running with session ID 4242\n" + json.dumps({"isError": True}),
             "Process running with session ID 4242\nScript error: boom",
             "Process running with session ID 4242\nrejected by user",
-            json.dumps({"exit_code": 0, "output": json.dumps({"exit_code": 1, "output": "inner failed"})}),
+            json.dumps({"output": json.dumps({"exit_code": 1, "output": "inner failed"})}),
         ]
         for output in cases:
             with self.subTest(output=output[:40]):
@@ -673,6 +673,14 @@ MUST_MASK = [
     f"SECRET={SECRET_WORD}", f"auth.token = {SECRET_WORD}", f"pwd={SECRET_WORD}",
     f"ACCESS_TOKEN := {SECRET_WORD}", f"AWS_SECRET_ACCESS_KEY={SECRET_WORD}",
     f"curl -u admin:{SECRET_WORD} https://x", f"curl --user admin:{SECRET_WORD} https://x",
+    # a false keyword earlier in the name must not hide the real one
+    f"KEYCLOAK_CLIENT_SECRET={SECRET_WORD}", f"MONKEY_API_KEY={SECRET_WORD}", f"TOKENIZER_API_TOKEN={SECRET_WORD}",
+    # values containing & or the other quote; YAML value on the next line
+    f"client_secret=abc&{SECRET_WORD}", "client_secret=\"abc'" + SECRET_WORD + "\"", f"api_key:\n  {SECRET_WORD}",
+    # unencoded ? or # inside a URL password
+    f"postgres://admin:p#{SECRET_WORD}@db.example/x", f"postgres://admin:p?{SECRET_WORD}@db.example/x",
+    # a short quoted part followed by more of the value; "#" inside a query value
+    f"pwd='a'{SECRET_WORD}", f"?token=p#{SECRET_WORD}", f'KEY="a"{SECRET_WORD}',
     # credentials in URLs, any length
     f"postgres://admin:{SECRET_WORD}@db.example.com/x", f"https://user:{SECRET_WORD * 30}@example.test",
     f"https://{'u' * 300}:{SECRET_WORD}@example.test",
@@ -733,11 +741,33 @@ class MaskingLargeInputTest(unittest.TestCase):
             "long userinfo": "https://" + "u" * 2_000_000 + ":p@x",
             "colons": "a:" * 1_000_000,
             "equals": "token=" * 300000,
+            "begin markers on one line": "-----BEGIN PRIVATE KEY----- " * 128000,
+            "false keywords in one name": "MONKEY_" * 300000 + "=1",
+            "url passwords": "a://b:" * 400000,
         }
         for name, text in cases.items():
             with self.subTest(case=name):
                 started = time.perf_counter()
                 cs.redact(text)
+                self.assertLess(time.perf_counter() - started, 3.0)
+
+
+class CodexParsingSpeedTest(unittest.TestCase):
+    """Codex outputs built to make result parsing slow must stay fast."""
+
+    def test_large_adversarial_outputs(self):
+        import time
+        cases = {
+            "many braces on one line": "a{" * 1000000,
+            "many lines starting with a brace": "{\n" * 1000000,
+            "nested and never closed": '{"a": [1,\n' * 100000,
+            "unterminated strings": ('{"a": "' + "x" * 4000 + "\n") * 500,
+            "many complete results": '{"exit_code": 0}\n' * 100000,
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                started = time.perf_counter()
+                src.codex_output({"output": "Script completed\nOutput:\n" + body}, shell=True)
                 self.assertLess(time.perf_counter() - started, 3.0)
 
 
@@ -747,8 +777,15 @@ class CodexStatusTest(unittest.TestCase):
         self.assertEqual(src.codex_output({"output": output}, shell=True)[1], "ok")
 
     def test_nested_tool_failures_still_count(self):
-        inner_error = json.dumps({"exit_code": 0, "output": json.dumps({"isError": True, "output": "bad"})})
-        self.assertEqual(src.codex_output({"output": inner_error}, shell=True)[1], "error")
+        wrapped_error = json.dumps({"output": json.dumps({"isError": True, "output": "bad"})})
+        self.assertEqual(src.codex_output({"output": wrapped_error}, shell=True)[1], "error")
+        multi_line = ('Script completed\nOutput:\n{\n  "exit_code": 1,\n  "output": "FAILED"\n}\n'
+                      '{"exit_code": 0, "output": "OK"}')
+        self.assertEqual(src.codex_output({"output": multi_line}, shell=True, code_mode=True)[1], "error")
+
+    def test_stdout_of_a_successful_command_is_not_its_status(self):
+        stdout_fixture = json.dumps({"exit_code": 0, "output": json.dumps({"isError": True, "output": "test fixture"})})
+        self.assertEqual(src.codex_output({"output": stdout_fixture}, shell=True)[1], "ok")
         two_runs = "Script completed\nOutput:\nProcess exited with code 0\nok\nProcess exited with code 2\nboom"
         self.assertEqual(src.codex_output({"output": two_runs}, shell=True, code_mode=True)[1], "error")
 
@@ -772,6 +809,12 @@ class CodexStatusTest(unittest.TestCase):
             digest = run_digest(write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000f5.jsonl", records))
         self.assertIn("17 passed", digest)
         self.assertIn("9 tests ok", digest)
+        # each poll is attributed to its own command, in the order the processes were reported:
+        # process 91 (reported first) is pytest, so the first poll waits on pytest and shows "17 passed"
+        polls = digest.split("🔧 write_stdin：")[1:]
+        self.assertIn("`pytest -q`", polls[0].splitlines()[0])
+        self.assertIn("17 passed", polls[0])
+        self.assertIn("`npm test`", polls[1].splitlines()[0])
 
 
 if __name__ == "__main__":
