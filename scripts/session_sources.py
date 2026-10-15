@@ -385,7 +385,6 @@ CODEX_REQUEST = re.compile(r"^## My request(?: for Codex)?:[ \t]*\n?", re.MULTIL
 CODEX_IMAGE_LABEL = re.compile(r"^\s*(?:</?image[^>]*>|\[Image #\d+\])\s*$")
 CODEX_EXIT = re.compile(r"Process exited with code (-?\d+)|^Exit code: (-?\d+)", re.MULTILINE)
 CODEX_SHELL_TOOLS = ("exec_command", "shell", "shell_command")
-CODEX_NESTED_EXIT = re.compile(r'"exit_code"\s*:\s*(-?\d+)')
 CODEX_RUNNING = re.compile(r"Process running with session ID (\d+)")
 # Shell commands written inside Codex "code mode" scripts: tools.exec_command({cmd: "..."}).
 CODEX_EMBEDDED_CMD = re.compile(r"""\bcmd\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)""")
@@ -476,38 +475,84 @@ def codex_json(text: str):
     return parsed if isinstance(parsed, dict) else None
 
 
-def codex_output(payload: dict, shell: bool = False):
-    """(text, status) for a Codex tool output record; status is "ok", "error" or "unknown".
+def result_fields(obj, depth: int = 0):
+    """(exit codes, error flags, running process IDs) found in a tool-result structure.
 
-    Shell results whose exit status cannot be found are "unknown", never assumed to have worked.
+    Follows "output" into nested results (a JSON string or object), a few levels deep.
     """
-    output = payload.get("output")
-    text = block_text(output)
-    exit_code, flagged = None, False
+    codes, errors, running = [], [], []
+    if not isinstance(obj, dict) or depth > 3:
+        return codes, errors, running
+    code = obj.get("exit_code", (obj.get("metadata") or {}).get("exit_code") if isinstance(obj.get("metadata"), dict) else None)
+    if isinstance(code, int):
+        codes.append(code)
+    if obj.get("isError") or obj.get("is_error"):
+        errors.append(True)
+    if obj.get("session_id") is not None and code is None:
+        running.append(str(obj["session_id"]))
+    inner = obj.get("output")
+    if isinstance(inner, str):
+        inner = codex_json(inner)
+    for found, extra in zip((codes, errors, running), result_fields(inner, depth + 1)):
+        found += extra
+    return codes, errors, running
+
+
+def codex_result_facts(text: str, code_mode: bool):
+    """Exit codes, error flags and running process IDs reported for a Codex tool call.
+
+    A direct shell call reports its status in a header before "Output:"; what comes
+    after is the command's own stdout, which may contain anything (a test fixture
+    with "exit_code": 1), so it is not read. A code-mode script prints one result
+    per step, so every line is read.
+    """
     parsed = codex_json(text)
     if parsed is not None:
-        exit_code = parsed.get("exit_code", (parsed.get("metadata") or {}).get("exit_code"))
-        flagged = bool(parsed.get("isError") or parsed.get("is_error"))
-        if "output" in parsed:
-            text = block_text(parsed["output"]) if not isinstance(parsed["output"], str) else parsed["output"]
-    if exit_code is None:
-        found = CODEX_EXIT.search(text)
-        if found:
-            exit_code = int(found.group(1) or found.group(2))
-    # Exit codes printed inside the output (a code-mode script, a nested tool result).
-    # Any failing step fails the call, even when the outer wrapper reports success.
-    nested = [int(code) for code in CODEX_NESTED_EXIT.findall(text)]
-    if not flagged and parsed is None:
-        flagged = bool(re.search(r'"is_?[eE]rror"\s*:\s*true', text))
-    failed = flagged or (exit_code not in (None, 0)) or any(code != 0 for code in nested) \
+        return result_fields(parsed)
+    region = text if code_mode else text.split("\nOutput:", 1)[0]
+    codes = [int(a or b) for a, b in CODEX_EXIT.findall(region)]
+    running = CODEX_RUNNING.findall(region)
+    errors = []
+    for line in region.splitlines():
+        found = codex_json(line.strip())
+        if found is not None:
+            more = result_fields(found)
+            codes += more[0]
+            errors += more[1]
+            running += more[2]
+    return codes, errors, running
+
+
+def codex_output(payload: dict, shell: bool = False, code_mode: bool = False):
+    """(text, status) for a Codex tool output record: "ok", "error", "running" or "unknown".
+
+    Any failing step fails the call, even when an outer wrapper reports success, and a
+    failure is never hidden behind "still running". Shell results whose exit status
+    cannot be found are "unknown", never assumed to have worked.
+    """
+    text = block_text(payload.get("output"))
+    code_mode = code_mode or text.lstrip().startswith(("Script completed", "Script error"))
+    codes, errors, running = codex_result_facts(text, code_mode)
+    parsed = codex_json(text)
+    if parsed is not None and "output" in parsed:
+        inner = parsed["output"]
+        text = inner if isinstance(inner, str) else block_text(inner)
+    failed = any(errors) or any(code != 0 for code in codes) \
         or bool(re.search(r"^Script error:", text, re.MULTILINE)) or "rejected by user" in text.lower()
-    if failed:  # checked first: a failure must never be hidden behind "still running"
+    if failed:
         return text, "error"
-    if CODEX_RUNNING.search(text) and exit_code is None:
+    if running and not codes:
         return text, "running"
-    if shell and exit_code is None and not nested:
+    if shell and not codes:
         return text, "unknown"
     return text, "ok"
+
+
+def running_ids(payload: dict) -> list:
+    """Process IDs a Codex result says are still running, in the order reported."""
+    text = block_text(payload.get("output"))
+    code_mode = text.lstrip().startswith(("Script completed", "Script error"))
+    return list(dict.fromkeys(codex_result_facts(text, code_mode)[2]))
 
 
 def read_codex(path: Path) -> SessionLog:
@@ -515,6 +560,7 @@ def read_codex(path: Path) -> SessionLog:
     tool_names = {}
     commands = {}  # call id -> shell command it ran
     shell_calls = set()  # code-mode calls that ran shell commands
+    script_steps = {}  # code-mode call id -> the shell commands it ran, in order
     running = {}  # Codex process session ID -> command still running, for write_stdin results
     for record in read_records(path):
         kind = record.get("type")
@@ -565,7 +611,7 @@ def read_codex(path: Path) -> SessionLog:
             steps = [e.payload["command"] for e in events if e.name.endswith("→shell")]
             if steps:
                 shell_calls.add(call_id)
-                # A script may run several commands; a later poll is linked to all of them.
+                script_steps[call_id] = steps
                 commands[call_id] = " ；".join(steps)
             if events[0].name == "write_stdin" and events[0].payload.get("session_id") in running:
                 earlier = running[events[0].payload["session_id"]]
@@ -576,10 +622,14 @@ def read_codex(path: Path) -> SessionLog:
             call_id = payload.get("call_id")
             name = tool_names.get(call_id, "?")
             shell = name in CODEX_SHELL_TOOLS or name == "write_stdin" or call_id in shell_calls
-            text, status = codex_output(payload, shell=shell)
-            still_running = CODEX_RUNNING.search(text)
-            if still_running and call_id in commands:
-                running[still_running.group(1)] = commands[call_id]
+            text, status = codex_output(payload, shell=shell, code_mode=call_id in shell_calls)
+            ids = running_ids(payload)
+            steps = script_steps.get(call_id, [])
+            for index, process in enumerate(ids):
+                if call_id not in commands:
+                    break
+                # Pair processes with script steps in order when the counts match; otherwise link to all.
+                running[process] = steps[index] if len(ids) == len(steps) else commands[call_id]
             log.events.append(result_event(when, text, name, status, str(call_id or "")))
     # Full text; the list masks it before shortening, so a cut never leaves half a secret.
     log.title = next((e.text.strip() for e in log.events if e.kind == "user"), "")

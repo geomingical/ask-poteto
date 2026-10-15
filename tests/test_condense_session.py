@@ -659,5 +659,120 @@ class MaskingSpeedTest(unittest.TestCase):
                          "see the key\n<redacted> ok")
 
 
+# ---------------------------------------------------------------- masking: what must be hidden, what must stay
+
+SECRET_WORD = "s3cr3tVALUE9"
+KEY_LINES = ["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", "BKcwggSjAgEAAoIBAQC7", "AAAAAA=="]
+
+MUST_MASK = [
+    # name = value, in every shape the old version caught, plus quoted and option forms
+    f"OPENAI_API_KEY={SECRET_WORD}", f"apiKey: {SECRET_WORD}", f"config: apiKey={SECRET_WORD}",
+    f"export GITHUB_TOKEN={SECRET_WORD}", f"--password={SECRET_WORD}", f"--api-key {SECRET_WORD}",
+    f"https://example.test/?token={SECRET_WORD}&x=1", f"db_password：{SECRET_WORD}",
+    f'{{"api_key": "{SECRET_WORD}"}}', f"client_secret='{SECRET_WORD}'", f"myApiKey={SECRET_WORD}",
+    f"SECRET={SECRET_WORD}", f"auth.token = {SECRET_WORD}", f"pwd={SECRET_WORD}",
+    f"ACCESS_TOKEN := {SECRET_WORD}", f"AWS_SECRET_ACCESS_KEY={SECRET_WORD}",
+    f"curl -u admin:{SECRET_WORD} https://x", f"curl --user admin:{SECRET_WORD} https://x",
+    # credentials in URLs, any length
+    f"postgres://admin:{SECRET_WORD}@db.example.com/x", f"https://user:{SECRET_WORD * 30}@example.test",
+    f"https://{'u' * 300}:{SECRET_WORD}@example.test",
+    # spoken
+    f"password is {SECRET_WORD}", f"密碼是 {SECRET_WORD}", f"Authorization: Bearer {SECRET_WORD}xyz",
+    # private keys: whole, and cut on either side, with short last lines
+    "-----BEGIN PRIVATE KEY-----\n" + "\n".join(KEY_LINES) + "\n-----END PRIVATE KEY-----",
+    "-----BEGIN OPENSSH PRIVATE KEY-----\n" + "\n".join(KEY_LINES) + "\n-----END OPENSSH PRIVATE KEY-----",
+    "-----BEGIN ENCRYPTED PRIVATE KEY-----\n" + "\n".join(KEY_LINES),
+    "\n".join(KEY_LINES) + "\n-----END RSA PRIVATE KEY-----",
+    "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,AB12\n\n" + "\n".join(KEY_LINES),
+]
+
+MUST_KEEP = [
+    "monkey = banana", "max_tokens: 4000", "the key is important", "keyboard=us", "tokenizer: bpe",
+    "MONKEY=1", "see the key below", "http://example.test/path?q=1", "https://example.test:8080/x",
+    "a: b", "x = 1, y = 2", "def password_strength(text): ...",
+    "ssh://git@host/repo", "git@github.com:org/repo.git", "mailto:me@example.test", "secretary: Alice",
+    "keys = [1,2]", "Set the API key in settings.", "ls -u name",
+]
+
+
+class MaskingCoverageTest(unittest.TestCase):
+    def test_secrets_are_masked(self):
+        for text in MUST_MASK:
+            with self.subTest(text=text[:50]):
+                masked = cs.redact(text)
+                self.assertNotIn(SECRET_WORD, masked)
+                for line in KEY_LINES:
+                    self.assertNotIn(line, masked)
+
+    def test_ordinary_text_is_kept(self):
+        for text in MUST_KEEP:
+            with self.subTest(text=text):
+                self.assertEqual(cs.redact(text), text)
+
+    def test_text_around_a_key_is_kept(self):
+        key = "-----BEGIN PRIVATE KEY-----\n" + "\n".join(KEY_LINES) + "\n-----END PRIVATE KEY-----"
+        self.assertEqual(cs.redact(f"before\n{key}\nafter"), "before\n<redacted>\nafter")
+        self.assertEqual(cs.redact("see the key\n" + "\n".join(KEY_LINES) + "\n-----END PRIVATE KEY----- ok"),
+                         "see the key\n<redacted> ok")
+
+
+class MaskingLargeInputTest(unittest.TestCase):
+    """Every pattern must stay fast on multi-megabyte inputs built to be slow."""
+
+    def test_large_adversarial_inputs(self):
+        import time
+        body = "\n".join(["MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"] * 80000)  # about 2.6 MB of key lines
+        cases = {
+            "lone begin with long body": "-----BEGIN PRIVATE KEY-----\n" + body,
+            "lone end with long body": body + "\n-----END PRIVATE KEY-----",
+            "many lone ends": "-----END PRIVATE KEY-----\nAAAAAAAAAAAAAAAA\n" * 60000,
+            "many lone begins": "-----BEGIN PRIVATE KEY-----\n" * 60000,
+            "key-like names": "key_" * 500000,
+            "names with separators": ("api_key_" * 100000) + "=1",
+            "url schemes": "a://" * 500000,
+            "long userinfo": "https://" + "u" * 2_000_000 + ":p@x",
+            "colons": "a:" * 1_000_000,
+            "equals": "token=" * 300000,
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                started = time.perf_counter()
+                cs.redact(text)
+                self.assertLess(time.perf_counter() - started, 3.0)
+
+
+class CodexStatusTest(unittest.TestCase):
+    def test_stdout_that_mentions_exit_codes_is_not_a_failure(self):
+        output = "Process exited with code 0\nOutput:\nfixture: {\"exit_code\": 1}\n3 passed"
+        self.assertEqual(src.codex_output({"output": output}, shell=True)[1], "ok")
+
+    def test_nested_tool_failures_still_count(self):
+        inner_error = json.dumps({"exit_code": 0, "output": json.dumps({"isError": True, "output": "bad"})})
+        self.assertEqual(src.codex_output({"output": inner_error}, shell=True)[1], "error")
+        two_runs = "Script completed\nOutput:\nProcess exited with code 0\nok\nProcess exited with code 2\nboom"
+        self.assertEqual(src.codex_output({"output": two_runs}, shell=True, code_mode=True)[1], "error")
+
+    def test_every_running_process_is_linked(self):
+        code = 'await tools.exec_command({cmd: "pytest -q"}); await tools.exec_command({cmd: "npm test"});'
+        records = [
+            codex_meta_record("019e0000-aaaa-7000-8000-0000000000f5"), codex_user("跑測試"),
+            codex("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": "c1", "input": code}),
+            codex("response_item", {"type": "custom_tool_call_output", "call_id": "c1", "output":
+                  'Script completed\nOutput:\n{"session_id": 91, "output": ""}\nProcess running with session ID 92'}),
+            codex("response_item", {"type": "function_call", "name": "write_stdin", "call_id": "c2",
+                                    "arguments": json.dumps({"session_id": 91, "chars": ""})}),
+            codex("response_item", {"type": "function_call_output", "call_id": "c2",
+                                    "output": "Process exited with code 0\nOutput:\n" + "." * 2000 + "\n17 passed"}),
+            codex("response_item", {"type": "function_call", "name": "write_stdin", "call_id": "c3",
+                                    "arguments": json.dumps({"session_id": 92, "chars": ""})}),
+            codex("response_item", {"type": "function_call_output", "call_id": "c3",
+                                    "output": "Process exited with code 0\nOutput:\n" + "." * 2000 + "\n9 tests ok"}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000f5.jsonl", records))
+        self.assertIn("17 passed", digest)
+        self.assertIn("9 tests ok", digest)
+
+
 if __name__ == "__main__":
     unittest.main()
