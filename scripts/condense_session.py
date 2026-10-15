@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -84,8 +85,10 @@ COMMAND_LIMIT = 600
 CODE_LIMIT = 1500
 TOOL_RESULT_LIMIT = 400
 ERROR_RESULT_LIMIT = 1200
-# Claude Code writes this when the person rejects a tool call and types a reason.
-REJECTION_REASON = re.compile(r"the user said:\s*(.+)", re.IGNORECASE | re.DOTALL)
+# Claude Code's message when the person rejects a tool call and types a reason. Both parts
+# must match, so an ordinary error that happens to contain "the user said:" stays an error.
+REJECTION_REASON = re.compile(r"doesn't want to proceed with this tool use.*?the user said:\s*(.+)",
+                              re.IGNORECASE | re.DOTALL)
 
 
 def redact(text):
@@ -129,9 +132,12 @@ def current_session(cwd, source):
     """
     session = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
     if source == "claude" and session:
+        # The ID is known, so only that log will do; never fall back to another session.
         matches = [path for _, path in src.find_by_id(session, ["claude"]) if path.stem == session]
         if len(matches) == 1:
             return source, matches[0]
+        sys.exit(f"Claude Code 說目前的對話是 {session}，但找不到唯一的那份紀錄（找到 {len(matches)} 份）。"
+                 "紀錄可能還沒寫入；請稍後再試，或改給 session ID。")
     target = str(Path(cwd).expanduser().resolve())
     found = []
     for path in src.all_logs(source):
@@ -175,6 +181,8 @@ def tool_brief(payload):
         if payload.get("description"):
             brief += f"（{safe(payload['description'], 80)}）"
         return brief
+    if payload.get("continues"):
+        return f"等待先前的指令：`{safe(payload['continues'], COMMAND_LIMIT)}`"
     if payload.get("code"):
         return f"{safe(payload.get('description') or '程式內容', 200)}\n\n```\n{safe(payload['code'], CODE_LIMIT)}\n```"
     detail = (payload.get("file_path") or payload.get("path") or payload.get("description")
@@ -272,13 +280,30 @@ def fmt_day(stamp):
 def result_line(event, command, keep_results):
     """How one successful or unknown result appears in the digest."""
     text = redact(event.text)
+    if event.status == "running":
+        return f"  - ↳ 仍在執行，結果在後面（{event.name}）"
     if event.status == "unknown":
         return f"  - ❔ 結束狀態不明（{event.name}）：{clip_end(text, TOOL_RESULT_LIMIT)}"
     if keep_results:
         return f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}"
     if CHECK_COMMAND.search(command):
         return f"  - ↳ 檢查結果（結尾）：{clip_end(text, TOOL_RESULT_LIMIT)}"
-    return f"  - ↳ 成功，輸出未列出（{len(text)} 字）"
+    return f"  - ↳ 成功，輸出未列出（{event.length or len(event.text)} 字）"
+
+
+def within(event, since):
+    """The part of an event at or after `since`, or None.
+
+    Folded retries keep every time they happened, so the copies after the cutoff
+    survive with their own count and the time of the first one kept.
+    """
+    times = event.times or (event.when,)
+    kept = [t for t in times if (parse_time(t) or since) >= since and parse_time(t) is not None]
+    if not kept:
+        return None
+    if len(kept) == len(times):
+        return event
+    return replace(event, when=kept[0], repeat=len(kept), times=tuple(kept))
 
 
 def digest_one(log, tag, keep_results, since=None):
@@ -292,11 +317,13 @@ def digest_one(log, tag, keep_results, since=None):
         if event.kind == "user":
             turn += 1  # counted even when hidden by --since, so turn numbers match the full digest
         if event.kind == "tool" and event.call_id:
-            commands[event.call_id] = str(event.payload.get("command") or event.payload.get("code") or "")
-        moment = parse_time(event.when)
-        if since and (moment is None or moment < since):
-            skipped += 1
-            continue
+            commands[event.call_id] = str(event.payload.get("command") or event.payload.get("continues")
+                                          or event.payload.get("code") or "")
+        if since:
+            event = within(event, since)
+            if event is None:
+                skipped += 1
+                continue
         when = fmt_day(event.when) if event.when else "--"
         if event.kind == "note":
             lines.append(f"- ⌨ {clip(redact(event.text), TOOL_INPUT_LIMIT)}")
@@ -354,12 +381,12 @@ def digest_one(log, tag, keep_results, since=None):
             lines.append(f"  - {label}（{event.name}）：{clip(text, ERROR_RESULT_LIMIT)}")
 
     header = [
-        f"## {tag}Session {log.id}",
+        f"## {tag}Session {redact(log.id)}",
         "",
-        f"- 紀錄檔：`{log.path}`",
-        f"- 工作目錄：`{log.cwd}`",
-        f"- 工具：{log.tool}，版本 {log.version}；模型：{', '.join(sorted(m for m in log.models if m))}",
-        f"- 權限模式：{', '.join(sorted(p for p in log.permission if p)) or '未記錄'}",
+        f"- 紀錄檔：`{redact(str(log.path))}`",
+        f"- 工作目錄：`{redact(str(log.cwd))}`",
+        f"- 工具：{log.tool}，版本 {redact(str(log.version))}；模型：{redact(', '.join(sorted(str(m) for m in log.models if m)))}",
+        f"- 權限模式：{redact(', '.join(sorted(str(p) for p in log.permission if p))) or '未記錄'}",
         f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次（其中使用者拒絕並說明理由 {rejections} 次）；檢查結果可能被吞掉的指令 {swallows} 次",
         f"- 另有 {loose_swallows} 個指令用了 `| head`、`2>/dev/null` 等寫法，多半只是縮短輸出，未逐一列出；診斷時可視需要 grep 原始紀錄",
     ]
@@ -368,14 +395,14 @@ def digest_one(log, tag, keep_results, since=None):
         lines.insert(0, f"\n> 〔{since.astimezone():%Y-%m-%d %H:%M} 之前的 {skipped} 則事件已省略〕\n")
     if log.instructions:
         header.append("- 載入的指示檔（依紀錄，出現順序）：")
-        header += [f"  - `{item}`" for item in log.instructions]
+        header += [f"  - `{redact(item)}`" for item in log.instructions]
     else:
         header.append(f"- 載入的指示檔：{log.missing_instructions}")
     if log.injected_rules:
-        header.append("- 臨時套用的規則（工具在對話中途注入的規則名稱，不是檔案路徑）：" + "、".join(log.injected_rules))
+        header.append("- 臨時套用的規則（工具在對話中途注入的規則名稱，不是檔案路徑）：" + redact("、".join(log.injected_rules)))
     if log.subagent_logs:
         header.append(f"- 另有 {len(log.subagent_logs)} 份 subagent 紀錄（可用同一支腳本另做摘要）：")
-        header += [f"  - `{sub}`" for sub in log.subagent_logs]
+        header += [f"  - `{redact(str(sub))}`" for sub in log.subagent_logs]
     if log.source == "codex":
         header.append("- Codex 的小助手紀錄只在同一天的資料夾裡找；跨過午夜才開始的小助手不會列出")
     return header, lines, signals, turn
@@ -395,10 +422,10 @@ def cmd_digest(args):
         tag = f"S{index} " if multi else ""
         header, lines, signals, turns = digest_one(log, tag, args.results, since)
         headers += header + [""]
-        bodies += [f"\n# {tag}時序：{log.tool} {log.id}（開始於 {fmt_day(log.first_timestamp())}）"] + lines
+        bodies += [f"\n# {tag}時序：{log.tool} {redact(log.id)}（開始於 {fmt_day(log.first_timestamp())}）"] + lines
         all_signals += signals
         total_turns += turns
-        title_ids.append(f"{log.tool} {log.id}")
+        title_ids.append(f"{log.tool} {redact(log.id)}")
         del log
 
     title = f"# 對話摘要：{len(targets)} 個 session（依開始時間排序）" if multi else f"# Session 摘要：{title_ids[0]}"
@@ -412,8 +439,9 @@ def cmd_digest(args):
 
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
-    # Final pass over everything written: any field that skipped masking above is masked here.
-    out.write_text(redact("\n".join(doc)) + "\n", encoding="utf-8")
+    # Every field was masked on its own above; masking the joined document would let a
+    # multi-line pattern (a private key) run across messages and erase what lies between.
+    out.write_text("\n".join(doc) + "\n", encoding="utf-8")
     size_kb = out.stat().st_size / 1000
     print(f"已寫入 {out}（{size_kb:.0f} KB，{len(targets)} 個 session，使用者 {total_turns} 輪，訊號 {len(all_signals)} 則）")
     if size_kb > LARGE_DIGEST_KB:

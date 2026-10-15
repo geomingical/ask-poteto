@@ -487,5 +487,88 @@ class SinceTest(unittest.TestCase):
             self.assertEqual(src.first_timestamp(path), "2026-10-13T05:00:00Z")
 
 
+# ---------------------------------------------------------------- re-review follow-ups
+
+class ReReviewTest(unittest.TestCase):
+    def test_known_session_id_never_falls_back_to_another_log(self):
+        with tempfile.TemporaryDirectory() as home:
+            work = Path(home) / "w"
+            work.mkdir()
+            write_log(Path(home) / ".claude" / "projects" / "-w", "old.jsonl", claude_log(str(work), "舊對話"))
+            env = {**ENV, "HOME": home, "CLAUDE_CODE_SESSION_ID": "active-not-on-disk"}
+            done = run_script("digest", "current", "--cwd", work, "--out", Path(home) / "d.md", env=env)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("active-not-on-disk", done.stderr)
+
+    def test_codex_code_mode_failure_is_an_error(self):
+        output = 'Script completed\nOutput:\n{"exit_code":1,"output":"Permission denied"}'
+        self.assertEqual(src.codex_output({"output": output}, shell=True)[1], "error")
+        self.assertEqual(src.codex_output({"output": "Script completed\nOutput:\ndone"}, shell=True)[1], "unknown")
+
+    def test_masking_stays_inside_one_message(self):
+        records = (claude_log("/tmp/proj", "什麼是 -----BEGIN PRIVATE KEY-----？")
+                   + [{"type": "assistant", "timestamp": "2026-10-13T01:00:30Z",
+                       "message": {"model": "m", "content": [{"type": "text", "text": "我沒問就刪了 report.md"}]}}]
+                   + claude_log("/tmp/proj", "那 -----END PRIVATE KEY----- 呢", "2026-10-13T01:01:00Z")
+                   + [tool_use("t1", "Bash", {"command": "export API_TOKEN=abc123def456"})])
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "pem.jsonl", records))
+        self.assertIn("report.md", digest)
+        self.assertIn("`export API_TOKEN=<redacted>`", digest)
+
+    def test_codex_title_is_masked_before_it_is_shortened(self):
+        pem = "-----BEGIN PRIVATE KEY-----\n" + "A" * 200 + "\n-----END PRIVATE KEY-----"
+        records = [codex_meta_record("019e0000-aaaa-7000-8000-0000000000f1"), codex_user(pem)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000f1.jsonl", records)
+            title = cs.summarize_session(path)["title"]
+        self.assertNotIn("AAAA", title)
+
+    def test_delayed_check_result_links_back_to_its_command(self):
+        records = [
+            codex_meta_record("019e0000-aaaa-7000-8000-0000000000f2"), codex_user("跑測試"),
+            codex("response_item", {"type": "function_call", "name": "exec_command", "call_id": "c1",
+                                    "arguments": json.dumps({"cmd": "pytest -q"})}),
+            codex("response_item", {"type": "function_call_output", "call_id": "c1",
+                                    "output": "Chunk ID: 1\nProcess running with session ID 4242\nOutput:\n..."}),
+            codex("response_item", {"type": "function_call", "name": "write_stdin", "call_id": "c2",
+                                    "arguments": json.dumps({"session_id": 4242, "chars": ""})}),
+            codex("response_item", {"type": "function_call_output", "call_id": "c2",
+                                    "output": "Process exited with code 0\nOutput:\n" + "." * 2000 + "\n17 passed"}),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "rollout-2026-10-13T01-00-00-019e0000-aaaa-7000-8000-0000000000f2.jsonl", records))
+        self.assertIn("17 passed", digest)
+        self.assertIn("`pytest -q`", digest.split("write_stdin")[1])
+
+    def test_large_results_are_not_kept_whole_in_memory(self):
+        big = "x" * 200_000 + " the end"
+        records = RECORDS[:1] + claude_tool("t1", "cat big.log", big)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = src.read_session(write_log(tmp, "big.jsonl", records))
+        result = next(e for e in log.events if e.kind == "result")
+        self.assertLess(len(result.text), 10_000)
+        self.assertIn("the end", result.text)
+        self.assertEqual(result.length, len(big))
+
+    def test_since_keeps_retries_after_the_cutoff(self):
+        ask = lambda when: {**omp_message({"role": "user", "attribution": "user", "content": "繼續"}), "timestamp": when}
+        fail = lambda when: {**omp_message({"role": "assistant", "stopReason": "error", "errorMessage": "RATE_LIMITED",
+                                            "content": []}), "timestamp": when}
+        records = OMP_RECORDS[:1] + [ask("2026-10-13T01:00:00Z"), fail("2026-10-13T01:00:01Z"),
+                                     ask("2026-10-13T03:00:00Z"), fail("2026-10-13T03:00:01Z")]
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "o/2026_01a0abab.jsonl", records), extra=("--since", "2026-10-13T02:00:00Z"))
+        self.assertIn("繼續", digest)
+        self.assertIn("RATE_LIMITED", digest)
+
+    def test_other_errors_mentioning_the_user_are_not_rejections(self):
+        records = RECORDS[:1] + claude_tool("t1", "pytest", "AssertionError: the user said: hello", is_error=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            digest = run_digest(write_log(tmp, "assert.jsonl", records))
+        self.assertNotIn("⛔ 使用者拒絕並說明", digest)
+        self.assertIn("AssertionError: the user said: hello", digest)
+
+
 if __name__ == "__main__":
     unittest.main()

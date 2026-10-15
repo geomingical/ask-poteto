@@ -36,7 +36,8 @@ class Event:
     """One thing that happened in a session, in the order it was recorded.
 
     kind: user, assistant, tool, result, note, compact, interrupt or api_error.
-    A result's status is "ok", "error" or "unknown" (the log did not say whether it worked).
+    A result's status is "ok", "error", "unknown" (the log did not say whether it worked)
+    or "running" (a long command reported progress; its outcome comes in a later result).
     """
     kind: str
     when: str = ""
@@ -45,6 +46,8 @@ class Event:
     payload: dict = field(default_factory=dict)
     status: str = "ok"
     call_id: str = ""  # links a tool call to its result
+    length: int = 0  # original length of a result's text before it was trimmed
+    times: tuple = ()  # when each folded retry happened, so a time filter can keep the later ones
     steering: bool = False  # typed while the agent was still working
     repeat: int = 1  # identical retries folded into this event
 
@@ -112,6 +115,31 @@ def head_records(path: Path, max_lines: int = 200):
                 continue
             if isinstance(record, dict):
                 yield record
+
+
+# A result keeps at most its start and end; the digest never shows more than that.
+RESULT_HEAD = 3000
+RESULT_TAIL = 1500
+
+
+def trim_result(text: str) -> str:
+    """Keep the start and end of a long tool output so huge logs do not fill memory.
+
+    Cuts fall on whitespace, so a secret is either kept whole (and masked later) or dropped.
+    """
+    if len(text) <= RESULT_HEAD + RESULT_TAIL:
+        return text
+    head_end = text.rfind(" ", 0, RESULT_HEAD)
+    head_end = max(head_end, text.rfind("\n", 0, RESULT_HEAD))
+    tail_start = len(text) - RESULT_TAIL
+    found = min([i for i in (text.find(" ", tail_start), text.find("\n", tail_start)) if i != -1], default=-1)
+    head = text[:head_end] if head_end > 0 else ""
+    tail = text[found:] if found != -1 else ""
+    return f"{head}\n…〔中間 {len(text) - len(head) - len(tail)} 字未保留〕…\n{tail}"
+
+
+def result_event(when: str, text: str, name: str, status: str, call_id: str) -> Event:
+    return Event("result", when, trim_result(text), name, status=status, call_id=call_id, length=len(text))
 
 
 def first_timestamp(path: Path) -> str:
@@ -274,14 +302,15 @@ def collapse_retries(events: list) -> list:
     for event in events:
         previous = folded[-1] if folded else None
         if event.kind == "api_error" and previous and previous.kind == "api_error" and previous.text == event.text:
-            folded[-1] = replace(previous, repeat=previous.repeat + 1)
+            folded[-1] = replace(previous, repeat=previous.repeat + 1, times=(previous.times or (previous.when,)) + (event.when,))
             continue
         if event.kind == "user":
             index = len(folded) - 1
             while index >= 0 and folded[index].kind == "api_error":
                 index -= 1
             if 0 <= index < len(folded) - 1 and folded[index].kind == "user" and folded[index].text == event.text:
-                folded[index] = replace(folded[index], repeat=folded[index].repeat + 1)
+                first = folded[index]
+                folded[index] = replace(first, repeat=first.repeat + 1, times=(first.times or (first.when,)) + (event.when,))
                 continue
         folded.append(event)
     return folded
@@ -331,9 +360,9 @@ def read_claude(path: Path) -> SessionLog:
             for block in message.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     name = tool_names.get(block.get("tool_use_id"), "?")
-                    log.events.append(Event("result", when, block_text(block.get("content")), name,
-                                            status="error" if block.get("is_error") else "ok",
-                                            call_id=str(block.get("tool_use_id") or "")))
+                    log.events.append(result_event(when, block_text(block.get("content")), name,
+                                                   "error" if block.get("is_error") else "ok",
+                                                   str(block.get("tool_use_id") or "")))
     log.subagent_logs = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
     return log
 
@@ -351,6 +380,8 @@ CODEX_REQUEST = re.compile(r"^## My request(?: for Codex)?:[ \t]*\n?", re.MULTIL
 CODEX_IMAGE_LABEL = re.compile(r"^\s*(?:</?image[^>]*>|\[Image #\d+\])\s*$")
 CODEX_EXIT = re.compile(r"Process exited with code (-?\d+)|^Exit code: (-?\d+)", re.MULTILINE)
 CODEX_SHELL_TOOLS = ("exec_command", "shell", "shell_command")
+CODEX_NESTED_EXIT = re.compile(r'"exit_code"\s*:\s*(-?\d+)')
+CODEX_RUNNING = re.compile(r"Process running with session ID (\d+)")
 # Shell commands written inside Codex "code mode" scripts: tools.exec_command({cmd: "..."}).
 CODEX_EMBEDDED_CMD = re.compile(r"""\bcmd\s*:\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`)""")
 PATCH_FILE = re.compile(r"\*\*\* (?:Add|Update|Delete) File: ([^\n\"'\\]+)")
@@ -412,6 +443,8 @@ def codex_tool_events(when: str, payload: dict) -> list:
         command = codex_shell_command(name, args) if name in CODEX_SHELL_TOOLS else ""
         if command:
             args = {"command": command, "description": args.get("justification") or ""}
+        elif name == "write_stdin" and args.get("session_id") is not None:
+            args = {"session_id": str(args["session_id"])}  # linked to its command in read_codex
         return [Event("tool", when, name=name, payload=args, call_id=call_id)]
     code = str(payload.get("input") or "")
     commands = [unquote(m) for m in CODEX_EMBEDDED_CMD.findall(code)]
@@ -455,6 +488,11 @@ def codex_output(payload: dict, shell: bool = False):
         found = CODEX_EXIT.search(text)
         if found:
             exit_code = int(found.group(1) or found.group(2))
+    nested = [int(code) for code in CODEX_NESTED_EXIT.findall(text)]  # results printed inside a code-mode script
+    if exit_code is None and nested:
+        exit_code = next((code for code in nested if code != 0), 0)
+    if CODEX_RUNNING.search(text) and exit_code is None:
+        return text, "running"
     failed = flagged or (exit_code not in (None, 0)) or bool(re.search(r"^Script error:", text, re.MULTILINE)) \
         or "rejected by user" in text.lower()
     if failed:
@@ -467,6 +505,9 @@ def codex_output(payload: dict, shell: bool = False):
 def read_codex(path: Path) -> SessionLog:
     log = SessionLog("codex", path, session_id(path, "codex"))
     tool_names = {}
+    commands = {}  # call id -> shell command it ran
+    shell_calls = set()  # code-mode calls that ran shell commands
+    running = {}  # Codex process session ID -> command still running, for write_stdin results
     for record in read_records(path):
         kind = record.get("type")
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
@@ -508,13 +549,29 @@ def read_codex(path: Path) -> SessionLog:
             if text.strip():
                 log.events.append(Event("assistant", when, text))
         elif kind == "response_item" and what in ("function_call", "custom_tool_call"):
-            tool_names[payload.get("call_id")] = payload.get("name", "?")
-            log.events += codex_tool_events(when, payload)
+            call_id = payload.get("call_id")
+            tool_names[call_id] = payload.get("name", "?")
+            events = codex_tool_events(when, payload)
+            if events[0].payload.get("command"):
+                commands[call_id] = events[0].payload["command"]
+            if any(e.name.endswith("→shell") for e in events):
+                shell_calls.add(call_id)
+            if events[0].name == "write_stdin" and events[0].payload.get("session_id") in running:
+                earlier = running[events[0].payload["session_id"]]
+                commands[call_id] = earlier
+                events[0] = replace(events[0], payload={**events[0].payload, "continues": earlier})
+            log.events += events
         elif kind == "response_item" and what in ("function_call_output", "custom_tool_call_output"):
-            name = tool_names.get(payload.get("call_id"), "?")
-            text, status = codex_output(payload, shell=name in CODEX_SHELL_TOOLS)
-            log.events.append(Event("result", when, text, name, status=status, call_id=str(payload.get("call_id") or "")))
-    log.title = next((e.text.strip()[:60] for e in log.events if e.kind == "user"), "")
+            call_id = payload.get("call_id")
+            name = tool_names.get(call_id, "?")
+            shell = name in CODEX_SHELL_TOOLS or name == "write_stdin" or call_id in shell_calls
+            text, status = codex_output(payload, shell=shell)
+            still_running = CODEX_RUNNING.search(text)
+            if still_running and call_id in commands:
+                running[still_running.group(1)] = commands[call_id]
+            log.events.append(result_event(when, text, name, status, str(call_id or "")))
+    # Full text; the list masks it before shortening, so a cut never leaves half a secret.
+    log.title = next((e.text.strip() for e in log.events if e.kind == "user"), "")
     log.subagent_logs = codex_children(path, log.id)
     return log
 
@@ -603,8 +660,8 @@ def read_omp(path: Path) -> SessionLog:
         elif role == "toolResult":
             exit_code = (message.get("details") or {}).get("exitCode") if isinstance(message.get("details"), dict) else None
             failed = bool(message.get("isError")) or exit_code not in (None, 0)
-            log.events.append(Event("result", when, block_text(message.get("content")), message.get("toolName", "?"),
-                                    status="error" if failed else "ok", call_id=str(message.get("toolCallId") or "")))
+            log.events.append(result_event(when, block_text(message.get("content")), message.get("toolName", "?"),
+                                           "error" if failed else "ok", str(message.get("toolCallId") or "")))
     log.subagent_logs = sorted((path.parent / path.stem).glob("*.jsonl"))
     return log
 
