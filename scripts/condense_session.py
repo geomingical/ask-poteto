@@ -238,7 +238,7 @@ def cmd_list(args):
     print("| 工具 | 開始 | 最後更新 | 專案 | Session ID | 大小 | 使用者發言 | 疑似糾正 | 標題 |")
     print("|---|---|---|---|---|---|---|---|---|")
     for s in rows:
-        print(f"| {src.TOOL_NAMES[s['source']]} | {s['started']} | {s['modified']} | {s['project']} | {s['id']} | "
+        print(f"| {src.TOOL_NAMES[s['source']]} | {s['started']} | {s['modified']} | {s['project']} | {redact(s['id'])} | "
               f"{s['size_mb']:.1f} MB | {s['user_turns']} | {s['hint_turns']} | {s['title']} |")
 
 
@@ -266,9 +266,9 @@ def result_line(event, command, keep_results):
     """How one successful or unknown result appears in the digest."""
     text = redact(event.text)
     if event.status == "running":
-        return f"  - ↳ 仍在執行，結果在後面（{event.name}）"
+        return f"  - ↳ 仍在執行，結果在後面（{redact(event.name)}）"
     if event.status == "unknown":
-        return f"  - ❔ 結束狀態不明（{event.name}）：{clip_end(text, TOOL_RESULT_LIMIT)}"
+        return f"  - ❔ 結束狀態不明（{redact(event.name)}）：{clip_end(text, TOOL_RESULT_LIMIT)}"
     if keep_results:
         return f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}"
     if CHECK_COMMAND.search(command):
@@ -335,7 +335,7 @@ def digest_one(log, tag, keep_results, since=None):
         elif event.kind == "assistant":
             lines.append(f"\n**【{agent}】{when}**\n\n{redact(event.text).strip()}\n")
         elif event.kind == "tool":
-            lines.append(f"- 🔧 {event.name}：{tool_brief(event.payload)}")
+            lines.append(f"- 🔧 {redact(event.name)}：{tool_brief(event.payload)}")
             command = str(event.payload.get("command") or "")
             if ERROR_SWALLOW_HINTS.search(command):
                 loose_swallows += 1
@@ -343,7 +343,7 @@ def digest_one(log, tag, keep_results, since=None):
             if risky:
                 swallows += 1
                 found = "、".join(risky)
-                signals.append(f"- {tag}{when} {event.name} ⚠ 檢查結果可能被吞掉（{found}）：{clip(redact(command), 150)}")
+                signals.append(f"- {tag}{when} {redact(event.name)} ⚠ 檢查結果可能被吞掉（{found}）：{clip(redact(command), 150)}")
                 lines.append(f"  - ⚠ 檢查結果可能被吞掉：{found}")
         elif event.kind == "result":
             text = redact(event.text)
@@ -357,13 +357,13 @@ def digest_one(log, tag, keep_results, since=None):
                 # The person stopped this action and said why: a direct correction.
                 rejections += 1
                 said = reason.group(1).strip()
-                signals.append(f"- {tag}{when} {event.name} ⛔ 使用者拒絕並說明：{clip(said, 200)}")
-                lines.append(f"  - ⛔ 使用者拒絕並說明（{event.name}）：{clip(said, ERROR_RESULT_LIMIT)}")
+                signals.append(f"- {tag}{when} {redact(event.name)} ⛔ 使用者拒絕並說明：{clip(said, 200)}")
+                lines.append(f"  - ⛔ 使用者拒絕並說明（{redact(event.name)}）：{clip(said, ERROR_RESULT_LIMIT)}")
                 continue
             denied = "denied" in lowered or "rejected" in lowered or "拒絕" in text
             label = "⛔ 被拒絕" if denied else "❌ 錯誤"
-            signals.append(f"- {tag}{when} {event.name} {label}：{clip(text, 150)}")
-            lines.append(f"  - {label}（{event.name}）：{clip(text, ERROR_RESULT_LIMIT)}")
+            signals.append(f"- {tag}{when} {redact(event.name)} {label}：{clip(text, 150)}")
+            lines.append(f"  - {label}（{redact(event.name)}）：{clip(text, ERROR_RESULT_LIMIT)}")
 
     header = [
         f"## {tag}Session {redact(log.id)}",

@@ -681,6 +681,14 @@ MUST_MASK = [
     f"postgres://admin:p#{SECRET_WORD}@db.example/x", f"postgres://admin:p?{SECRET_WORD}@db.example/x",
     # a short quoted part followed by more of the value; "#" inside a query value
     f"pwd='a'{SECRET_WORD}", f"?token=p#{SECRET_WORD}", f'KEY="a"{SECRET_WORD}',
+    # from the security review: "API" glued to the word before, two URLs in a row, newline before "="
+    f"SERPAPI_KEY={SECRET_WORD}", f"export RAPIDAPI_KEY={SECRET_WORD}", f"NEWSAPI_KEY: {SECRET_WORD}",
+    f"1API_KEY: {SECRET_WORD}", f"redis://localhost:6379,postgres://user:{SECRET_WORD}@db",
+    f"proxy=http://p:3128;https://u:{SECRET_WORD}@h", f"GITHUB_TOKEN\n  = {SECRET_WORD}",
+    # keys cut off at the end: Windows line ends, body on the marker line, text after the body
+    "-----BEGIN RSA PRIVATE KEY-----\r\n" + "\r\n".join(KEY_LINES) + "\r\n",
+    "-----BEGIN PRIVATE KEY-----" + KEY_LINES[0] + KEY_LINES[1],
+    "-----BEGIN PRIVATE KEY-----\n" + KEY_LINES[0] + " trailing text\n" + KEY_LINES[1],
     # credentials in URLs, any length
     f"postgres://admin:{SECRET_WORD}@db.example.com/x", f"https://user:{SECRET_WORD * 30}@example.test",
     f"https://{'u' * 300}:{SECRET_WORD}@example.test",
@@ -785,11 +793,31 @@ class CodexStatusTest(unittest.TestCase):
                       '{"exit_code": 0, "output": "OK"}')
         self.assertEqual(src.codex_output({"output": multi_line}, shell=True, code_mode=True)[1], "error")
 
+    def test_failures_printed_inside_a_list_or_after_a_label_count(self):
+        for body in ('[{"exit_code": 1, "output": "FAILED"}, {"exit_code": 0}]', 'step 1: {"exit_code": 1}',
+                     'results = {"isError": true}'):
+            with self.subTest(body=body):
+                output = "Script completed\nOutput:\n" + body
+                self.assertEqual(src.codex_output({"output": output}, shell=True, code_mode=True)[1], "error")
+                self.assertEqual(src.codex_output({"output": output})[1], "error")
+
+    def test_a_running_step_is_not_reported_as_done(self):
+        output = 'Script completed\nOutput:\n{"session_id": 4}\nProcess exited with code 0'
+        self.assertEqual(src.codex_output({"output": output}, shell=True, code_mode=True)[1], "running")
+
+    def test_status_details(self):
+        self.assertEqual(src.codex_output({"output": json.dumps({"exit_code": None, "metadata": {"exit_code": 1}})})[1], "error")
+        self.assertEqual(src.codex_output({"output": "\nExit code: 1\nOutput:\nx"}, shell=True)[1], "error")
+        self.assertEqual(src.codex_output({"output": json.dumps({"output": "Exit code: 1\nOutput:\nx"})}, shell=True)[1], "error")
+
     def test_two_results_on_one_line_are_both_read(self):
         output = 'Script completed\nOutput:\n{"exit_code": 0} {"exit_code": 1}'
         self.assertEqual(src.codex_output({"output": output}, shell=True, code_mode=True)[1], "error")
-        junk = 'Script completed\nOutput:\n{"exit_code": 0} trailing words'
-        self.assertEqual(src.codex_output({"output": junk}, shell=True, code_mode=True)[1], "unknown")
+        # In a script's output, words next to a result are labels or logs, not an unreadable result.
+        labelled = 'Script completed\nOutput:\n{"exit_code": 0} trailing words\n[INFO] done {x}'
+        self.assertEqual(src.codex_output({"output": labelled}, shell=True, code_mode=True)[1], "ok")
+        cut_off = 'Script completed\nOutput:\nstep 2: {"exit_code": 1, "output": "FAI'
+        self.assertEqual(src.codex_output({"output": cut_off}, shell=True, code_mode=True)[1], "unknown")
 
     def test_only_the_status_header_of_a_shell_call_is_read(self):
         no_marker = "Process exited with code 0\nlots of logs\n" + '{"exit_code": 1}\nProcess running with session ID 91'

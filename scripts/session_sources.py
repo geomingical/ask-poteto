@@ -492,7 +492,9 @@ def result_fields(obj, depth: int = 0):
     if not isinstance(obj, dict) or depth > 3:
         return codes, errors, running
     metadata = obj.get("metadata") if isinstance(obj.get("metadata"), dict) else {}
-    code = obj.get("exit_code", metadata.get("exit_code"))
+    code = obj.get("exit_code")
+    if code is None:
+        code = metadata.get("exit_code")
     if isinstance(code, int):
         codes.append(code)
     if obj.get("isError") or obj.get("is_error"):
@@ -520,18 +522,28 @@ CODEX_HEADER_LINE = re.compile(
 def shell_header(text: str) -> str:
     """The leading status lines of a direct shell result."""
     lines = []
-    for line in text.split("\n", 12)[:12]:
+    for line in text.lstrip("\r\n").split("\n", 12)[:12]:
         if not CODEX_HEADER_LINE.match(line.strip()):
             break
         lines.append(line)
     return "\n".join(lines)
 
 
-def json_blocks(text: str):
-    """(position, object) for each JSON object that starts a line, including multi-line ones,
-    plus how many "{" lines could not be parsed. One pass over the text."""
+# A result printed anywhere in a script's output: an object with a key, or a list of objects.
+# "[INFO]" or "{x}" in ordinary log text is not mistaken for one.
+JSON_START = re.compile(r'\{(?=\s*")|\[(?=\s*\{)')
+
+
+def json_blocks(text: str, anywhere: bool = False):
+    """(position, object) for each JSON result in text, including multi-line ones and
+    the objects inside a printed list, plus how many could not be parsed. One pass.
+
+    By default only objects that start a line are read; `anywhere` also reads a result
+    printed after a label ("step 1: {...}") or as a list ("[{...}, {...}]").
+    """
     blocks, unparsed, pos = [], 0, 0
-    for match in LINE_START_BRACE.finditer(text):
+    starts = JSON_START.finditer(text) if anywhere else LINE_START_BRACE.finditer(text)
+    for match in starts:
         brace = match.end() - 1
         if brace < pos:  # inside an object already read
             continue
@@ -546,11 +558,15 @@ def json_blocks(text: str):
                 break
             if isinstance(obj, dict):
                 blocks.append((brace, obj))
+            elif isinstance(obj, list):
+                blocks += [(brace, item) for item in obj if isinstance(item, dict)]
             pos = end
+            if anywhere:  # later results on the line are found by the scan itself; labels are fine
+                break
             following = SPACES.match(text, end).end()
             if following >= len(text) or text[following] == "\n":
                 break
-            if text[following] != "{":
+            if text[following] not in "{[":
                 unparsed += 1
                 break
             brace = following
@@ -569,6 +585,9 @@ def codex_result_facts(text: str, code_mode: bool):
     parsed = codex_json(text)
     if parsed is not None:
         codes, errors, running = result_fields(parsed)
+        inner = parsed.get("output")
+        if not codes and isinstance(inner, str) and codex_json(inner) is None:
+            codes = [int(a or b) for a, b in CODEX_EXIT.findall(shell_header(inner))]
         return codes, errors, running, False
     region = text if code_mode else shell_header(text)
     codes, errors, ordered = [], [], []
@@ -576,7 +595,7 @@ def codex_result_facts(text: str, code_mode: bool):
         codes.append(int(match.group(1) or match.group(2)))
     for match in CODEX_RUNNING.finditer(region):
         ordered.append((match.start(), match.group(1)))
-    blocks, unparsed = json_blocks(region)
+    blocks, unparsed = json_blocks(region, anywhere=code_mode)
     for position, obj in blocks:
         more = result_fields(obj)
         codes += more[0]
@@ -604,17 +623,17 @@ def codex_output(payload: dict, shell: bool = False, code_mode: bool = False):
         or bool(re.search(r"^Script error:", text, re.MULTILINE)) or "rejected by user" in text.lower()
     if failed:
         return text, "error"
-    if running and not codes:
+    if running:  # a step still running means the call is not finished, even if another step is
         return text, "running"
     if (shell and not codes) or unreadable:
         return text, "unknown"
     return text, "ok"
 
 
-def running_ids(payload: dict) -> list:
+def running_ids(payload: dict, code_mode: bool = False) -> list:
     """Process IDs a Codex result says are still running, in the order they appear."""
     text = block_text(payload.get("output"))
-    code_mode = text.lstrip().startswith(("Script completed", "Script error"))
+    code_mode = code_mode or text.lstrip().startswith(("Script completed", "Script error"))
     return list(dict.fromkeys(codex_result_facts(text, code_mode)[2]))
 
 
@@ -686,7 +705,7 @@ def read_codex(path: Path) -> SessionLog:
             name = tool_names.get(call_id, "?")
             shell = name in CODEX_SHELL_TOOLS or name == "write_stdin" or call_id in shell_calls
             text, status = codex_output(payload, shell=shell, code_mode=call_id in shell_calls)
-            ids = running_ids(payload)
+            ids = running_ids(payload, code_mode=call_id in shell_calls)
             steps = script_steps.get(call_id, [])
             for index, process in enumerate(ids):
                 if call_id not in commands:

@@ -26,21 +26,39 @@ SPOKEN_PASSWORD = re.compile(r"(?i)\b(password|passwd)(\s+(?:is|=)\s+)\S+|(密�
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 PEM_END = re.compile(r"-----END [A-Z ]*PRIVATE KEY-----")
 KEY_BODY_LINE = re.compile(r"[A-Za-z0-9+/=]+")  # base64, including a short last line such as "AAAA=="
-# One line after a BEGIN marker: base64, an encrypted-key header (Proc-Type, DEK-Info) or blank.
-# Matched from a position, so a line that is not key material is rejected at its first odd character.
-KEY_LINE_AT = re.compile(r"[ \t]*(?:([A-Za-z0-9+/=]+)|([A-Za-z-]+: [^\n]*))?[ \t]*(?:\n|\Z)")
+# Pieces of one line after a BEGIN marker, matched from a position (never by slicing the rest).
+LINE_INDENT = re.compile(r"[ \t\r]*")
+BASE64_RUN = re.compile(r"[A-Za-z0-9+/=]+")
+KEY_HEADER_AT = re.compile(r"[A-Za-z-]+: [^\n]*")  # Proc-Type / DEK-Info in an encrypted key
+LINE_REST_EMPTY = re.compile(r"[ \t\r]*(?:\n|\Z)")
+LONG_RUN = 16  # a base64 run this long is key material even with other text after it
 
 
 def lines_after(text, pos):
-    """End of the key lines that follow pos (header, blank and base64 lines)."""
+    """End of the key material after pos: base64 lines (also on the marker line itself and
+    with Windows line ends), encrypted-key headers and blank lines."""
     end = pos
     while pos < len(text):
-        line = KEY_LINE_AT.match(text, pos)
-        if not line or line.end() == pos:
-            break
-        if line.group(1) or line.group(2):
-            end = line.end(1) if line.group(1) else line.end(2)
-        pos = line.end()
+        start = LINE_INDENT.match(text, pos).end()
+        header = KEY_HEADER_AT.match(text, start)  # checked first: "Proc-Type" also starts like base64
+        run = None if header else BASE64_RUN.match(text, start)
+        piece_end = header.end() if header else run.end() if run else start
+        rest = LINE_REST_EMPTY.match(text, piece_end)
+        if rest:  # the whole line is key material (or blank)
+            if piece_end > start:
+                end = piece_end
+            if rest.end() == pos:
+                break
+            pos = rest.end()
+            continue
+        if run and run.end() - run.start() >= LONG_RUN:  # key line with other text after it
+            end = run.end()
+            newline = text.find("\n", run.end())
+            if newline == -1:
+                break
+            pos = newline + 1
+            continue
+        break
     return end
 
 
@@ -103,8 +121,9 @@ def mask_url_credentials(text):
             password = URL_PASSWORD.match(text, pos + 1)
             if password.end() < len(text) and text[password.end()] == "@":
                 pieces += [text[start:pos + 1], MASK]
-                start = password.end()
-            pos = password.end()
+                start = pos = password.end()
+            # Not a password (host:port): look for the next "://" right after, not past the
+            # scan, or "redis://h:6379,postgres://u:pw@db" would skip the second URL.
         pos = max(pos, found + 3)
     return "".join(pieces) + text[start:]
 
@@ -114,7 +133,7 @@ def mask_url_credentials(text):
 SECRET_KEYWORD = re.compile(r"api_?key|apikey|key|token|secret|password|passwd|pwd", re.IGNORECASE)
 NAME_CHARS = re.compile(r"[A-Za-z0-9_.-]*")
 # "=" or ":" (or ":="), optionally after a closing quote; a YAML value may sit on the next line.
-SEPARATOR = re.compile(r"""["']?[ \t]*(?::=|[=:：])\s*""")
+SEPARATOR = re.compile(r"""["']?\s*(?::=|[=:：])\s*""")
 OPTION_SEPARATOR = re.compile(r"[ \t]+")
 QUOTED_VALUE = {'"': re.compile(r'"[^"\n]*"'), "'": re.compile(r"'[^'\n]*'")}
 VALUE = re.compile(r"[^\s,;]+")
@@ -174,6 +193,7 @@ def mask_assignments(text):
         if not run_start <= keyword.start() < run_end:
             run_start, run_end = keyword.start(), NAME_CHARS.match(text, keyword.end()).end()
         if not keyword_is_a_name_part(text, keyword.start(), keyword.end()):
+            pos = keyword.start() + 1  # a shorter keyword may start inside this one
             continue
         name_end = run_end
         separator = SEPARATOR.match(text, name_end)
