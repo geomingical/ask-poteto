@@ -509,6 +509,22 @@ def result_fields(obj, depth: int = 0):
 
 
 LINE_START_BRACE = re.compile(r"^[ \t]*\{", re.MULTILINE)
+SPACES = re.compile(r"[ \t]*")
+# The status lines Codex puts before a direct shell call's output. Everything after them is the
+# command's own stdout, which is never read as a status.
+CODEX_HEADER_LINE = re.compile(
+    r"(?:Chunk ID|Wall time|Process exited with code|Process running with session ID|Original token count"
+    r"|Exit code|Total output lines)\b")
+
+
+def shell_header(text: str) -> str:
+    """The leading status lines of a direct shell result."""
+    lines = []
+    for line in text.split("\n", 12)[:12]:
+        if not CODEX_HEADER_LINE.match(line.strip()):
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def json_blocks(text: str):
@@ -521,14 +537,23 @@ def json_blocks(text: str):
             continue
         if unparsed >= MAX_JSON_FAILURES:
             break
-        try:
-            obj, end = JSON_DECODER.raw_decode(text, brace)
-        except (ValueError, RecursionError):
-            unparsed += 1
-            continue
-        if isinstance(obj, dict):
-            blocks.append((brace, obj))
-        pos = end
+        # Several results can share a line; read each, and treat anything else left on the line as unreadable.
+        while True:
+            try:
+                obj, end = JSON_DECODER.raw_decode(text, brace)
+            except (ValueError, RecursionError):
+                unparsed += 1
+                break
+            if isinstance(obj, dict):
+                blocks.append((brace, obj))
+            pos = end
+            following = SPACES.match(text, end).end()
+            if following >= len(text) or text[following] == "\n":
+                break
+            if text[following] != "{":
+                unparsed += 1
+                break
+            brace = following
     return blocks, unparsed
 
 
@@ -545,7 +570,7 @@ def codex_result_facts(text: str, code_mode: bool):
     if parsed is not None:
         codes, errors, running = result_fields(parsed)
         return codes, errors, running, False
-    region = text if code_mode else text.split("\nOutput:", 1)[0]
+    region = text if code_mode else shell_header(text)
     codes, errors, ordered = [], [], []
     for match in CODEX_EXIT.finditer(region):
         codes.append(int(match.group(1) or match.group(2)))
@@ -667,7 +692,8 @@ def read_codex(path: Path) -> SessionLog:
                 if call_id not in commands:
                     break
                 # Pair processes with script steps in order when the counts match; otherwise link to all.
-                running[process] = steps[index] if len(ids) == len(steps) else commands[call_id]
+                # A process keeps the command that started it; a later mention does not move it.
+                running.setdefault(process, steps[index] if len(ids) == len(steps) else commands[call_id])
             log.events.append(result_event(when, text, name, status, str(call_id or "")))
     # Full text; the list masks it before shortening, so a cut never leaves half a secret.
     log.title = next((e.text.strip() for e in log.events if e.kind == "user"), "")

@@ -590,7 +590,7 @@ class ThirdReviewTest(unittest.TestCase):
 
     def test_errors_win_over_running_and_outer_success(self):
         cases = [
-            "Process running with session ID 4242\n" + json.dumps({"isError": True}),
+            "Script completed\nOutput:\nProcess running with session ID 4242\n" + json.dumps({"isError": True}),
             "Process running with session ID 4242\nScript error: boom",
             "Process running with session ID 4242\nrejected by user",
             json.dumps({"output": json.dumps({"exit_code": 1, "output": "inner failed"})}),
@@ -763,6 +763,8 @@ class CodexParsingSpeedTest(unittest.TestCase):
             "nested and never closed": '{"a": [1,\n' * 100000,
             "unterminated strings": ('{"a": "' + "x" * 4000 + "\n") * 500,
             "many complete results": '{"exit_code": 0}\n' * 100000,
+            "many results on one line": "{}" * 800000,
+            "many spaced results on one line": "{} " * 400000 + "x",
         }
         for name, body in cases.items():
             with self.subTest(case=name):
@@ -782,6 +784,17 @@ class CodexStatusTest(unittest.TestCase):
         multi_line = ('Script completed\nOutput:\n{\n  "exit_code": 1,\n  "output": "FAILED"\n}\n'
                       '{"exit_code": 0, "output": "OK"}')
         self.assertEqual(src.codex_output({"output": multi_line}, shell=True, code_mode=True)[1], "error")
+
+    def test_two_results_on_one_line_are_both_read(self):
+        output = 'Script completed\nOutput:\n{"exit_code": 0} {"exit_code": 1}'
+        self.assertEqual(src.codex_output({"output": output}, shell=True, code_mode=True)[1], "error")
+        junk = 'Script completed\nOutput:\n{"exit_code": 0} trailing words'
+        self.assertEqual(src.codex_output({"output": junk}, shell=True, code_mode=True)[1], "unknown")
+
+    def test_only_the_status_header_of_a_shell_call_is_read(self):
+        no_marker = "Process exited with code 0\nlots of logs\n" + '{"exit_code": 1}\nProcess running with session ID 91'
+        self.assertEqual(src.codex_output({"output": no_marker}, shell=True)[1], "ok")
+        self.assertEqual(src.running_ids({"output": no_marker}), [])
 
     def test_stdout_of_a_successful_command_is_not_its_status(self):
         stdout_fixture = json.dumps({"exit_code": 0, "output": json.dumps({"isError": True, "output": "test fixture"})})
