@@ -4,7 +4,7 @@
 
 **English** | [繁體中文](README.zh-TW.md)
 
-A [Claude Code](https://claude.com/claude-code) skill that works out **where a conversation went wrong**, and what to build so it doesn't happen again.
+A [Claude Code](https://claude.com/claude-code) skill that works out **where a conversation went wrong**, and what to build so it doesn't happen again. It reads sessions from **Claude Code, Codex CLI and OMP (oh-my-pi)**.
 
 Give it one session, or several sessions that continue the same piece of work. It reads the full log, including your messages and every tool call. Each time you had to **correct or step in** for Claude, it asks: *which layer should have caught this?*
 
@@ -75,13 +75,16 @@ In Claude Code:
 /ask-poteto current             # diagnose the current conversation (up to the previous turn)
 /ask-poteto 3f2a9c1b            # diagnose one session (the first few characters of the ID are enough)
 /ask-poteto 3f2a9c1b 8e7d6c5a   # diagnose several sessions that continue one piece of work, merged in time order
+/ask-poteto 01a134cb            # a Codex or OMP session ID works the same way; the tool is detected from the log
 ```
+
+The session list shows Claude Code, Codex and OMP sessions together, with a column saying which tool each one came from. Sessions from different tools can be merged into one digest when the same work moved between them.
 
 You can also just ask in plain language, for example "diagnose that session", "why does Claude keep getting this wrong?", or "check my CLAUDE.md for problems".
 
 What happens:
 
-1. The bundled script condenses the session log into a text-only digest in a temporary folder. It keeps the full conversation and the exact commands Claude ran, shortens tool output, drops images, masks things that look like keys or passwords, lists the instruction files that were loaded, and flags commands that can hide a failure. If the digest is long, you are asked first whether to diagnose all of it or only part (cheaper).
+1. The bundled script condenses the session log into a text-only digest in a temporary folder. It keeps the full conversation, the exact commands Claude ran, the results of checks such as tests, and the reasons you gave when rejecting an action, shortens other tool output, drops images, masks things that look like keys or passwords, lists the instruction files that were loaded, and flags commands that can hide a failure. If the digest is long, you are asked first whether to diagnose all of it or only part (cheaper).
 2. Claude lists which instruction files were in effect, sorted into global and project-level.
 3. A subagent (a helper Claude with a clean context window) reads the digest against [`references/rubric.md`](references/rubric.md) and writes the diagnosis. It is instructed not to edit files; this is an instruction, not a technical lock.
 4. The main Claude spot-checks the quoted evidence and gives you a **short report** that fits on one screen: a one-line conclusion, how your prompts could be clearer, and the 3 changes most worth making (with text you can paste). Ask for the full report if you want the details.
@@ -93,21 +96,36 @@ If you only want your rules checked, just say "check my CLAUDE.md"; no session i
 ### Using the script on its own
 
 ```bash
-python3 scripts/condense_session.py list --project my-app --limit 20
+python3 scripts/condense_session.py list --project my-app --limit 20             # all three tools
+python3 scripts/condense_session.py list --source codex --limit 20               # only Codex (or omp, claude)
 python3 scripts/condense_session.py digest <session-id> [<more-ids> ...] --out /tmp/digest.md
 ```
 
+Where each tool keeps its logs, and what the digest does with each format:
+
+| Tool | Logs | Notes |
+|---|---|---|
+| Claude Code | `~/.claude/projects/` | Loaded instruction files are read from the log. |
+| Codex CLI | `~/.codex/sessions/`, `~/.codex/archived_sessions/` | Text Codex adds to your messages (AGENTS.md, environment info, IDE context) is not counted as something you said. Helper-agent logs are listed under their parent session. |
+| OMP | `~/.omp/agent/sessions/` | OMP doesn't record which instruction files it loaded, so that list is inferred. Messages re-sent many times after rate-limit errors are folded into one turn with a count. |
+
 ## Privacy
 
-- Everything runs locally. The script only reads `~/.claude/projects/`, where Claude Code keeps session logs, and writes the digest to wherever you point it.
-- The digest contains your full conversation text. Masking is **best-effort**: it catches common token formats, `API_KEY=...` assignments, passwords in URLs, `Bearer` tokens and "password is ...", not everything. Don't share digests. The temporary digest is deleted once you have no more questions.
-- The skill never picks sessions on its own. It diagnoses only the sessions you name.
+- Everything runs locally. The script only reads the session-log folders listed above (`~/.claude/projects/`, `~/.codex/sessions/`, `~/.codex/archived_sessions/`, `~/.omp/agent/sessions/`) and writes the digest to wherever you point it.
+- The skill never picks sessions on its own. It diagnoses only the sessions you name. To find the session you mean, a few cases **open the start of other logs** (the first lines only, to see the working folder or which tool wrote them), not their content:
+  - `current` without a session ID (Codex, OMP) compares each log's working folder.
+  - `list` reads every session it shows, to count turns and find a title; `--project` on Codex logs first reads the start of each Codex log to match the folder.
+  - Diagnosing a Codex session reads the first line of the other logs in **the same day's folder**, to find the helper agents it spawned.
+- The digest contains your full conversation text. Masking is applied to every field of the digest and the list, and catches common token formats, `API_KEY=...` assignments, passwords in URLs, `Bearer` tokens and "password is ...", but **not everything**. Don't share digests. The temporary digest is deleted in the same turn the report is delivered.
 
 ## Limitations
 
-- Claude Code's session log format (`.jsonl`) is not a documented public format and may change between versions. If the digest comes out empty or incomplete, please open an issue.
+- None of the three session log formats (`.jsonl`) is documented publicly, and each may change between versions. The Codex and OMP readers were built from logs written by Codex CLI 0.10x–0.16x and OMP log format v3. If the digest comes out empty or incomplete, please open an issue.
 - The "possible correction" and "may hide a failure" markers are just pattern matches. They miss real problems and flag harmless questions. "May hide a failure" is only flagged on check commands such as tests and builds; other cases rely on the subagent reading the commands themselves.
 - A single session is a small sample. The skill labels suggestions based on one session as low confidence.
+- Successful tool output is not listed by default (except check commands such as tests, whose ending is kept); the diagnosis goes back to the raw log when needed. Add `--results` to `digest` to keep it all, or `--since "2026-10-13 14:30"` to look only at the later part of a long session.
+- Codex helper agents are looked up only in the same day's folder; one that started after midnight is not listed.
+- "Rejected with a reason" is matched against Claude Code's current rejection message; if that wording changes, it falls back to a plain "rejected" marker.
 
 ## File structure
 
@@ -115,7 +133,9 @@ python3 scripts/condense_session.py digest <session-id> [<more-ids> ...] --out /
 ask-poteto/
 ├── SKILL.md                     # the workflow Claude follows
 ├── references/rubric.md         # diagnostic rubric read by the subagent
-├── scripts/condense_session.py  # session log → Markdown digest
+├── scripts/condense_session.py  # session log → Markdown digest (command line, signals)
+├── scripts/session_sources.py   # readers for Claude Code, Codex CLI and OMP logs
+├── scripts/redaction.py         # masks strings that look like keys or passwords
 └── tests/                       # tests for the digest script: python3 -m unittest discover -s tests
 ```
 

@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
-"""Condense a Claude Code session log (.jsonl) into a readable Markdown digest.
+"""Condense a Claude Code, Codex CLI or OMP session log (.jsonl) into a readable Markdown digest.
 
 Usage:
-  condense_session.py list [--project KEYWORD] [--limit N]
-  condense_session.py digest <session-id | path.jsonl> [more ...] --out FILE
+  condense_session.py list [--source all|claude|codex|omp] [--project KEYWORD] [--limit N]
+  condense_session.py digest <session-id | path.jsonl | current> [more ...] --out FILE [--source ...]
 
 Several targets (one piece of work resumed across sessions) are merged into one
 digest in chronological order, tagged S1, S2, ...
 
 The digest keeps every typed user message and assistant reply in full, shows
 slash commands as one-line notes (not user turns), shortens tool calls and
-results, lists the instruction files Claude Code loaded, and marks signals worth a diagnostician's attention:
+results, lists the instruction files the tool loaded, and marks signals worth a diagnostician's attention:
 tool errors, interruptions, denied tool calls, user turns that look like
 corrections, and shell commands written in a way that can hide a failure. The signals are hints for where to look, not verdicts.
 """
 import argparse
 import json
+import os
 import re
 import sys
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-PROJECTS = Path.home() / ".claude" / "projects"
+import session_sources as src
+from redaction import redact
+
 # Above this size, reading the whole digest costs noticeably more usage; ask first.
 LARGE_DIGEST_KB = 300
 
@@ -65,33 +69,15 @@ def risky_swallow(command):
     if FOLLOW_UP_ACTION.search(command) or forced:
         return list(dict.fromkeys(idioms))
     return []
-TOKEN_PATTERNS = [
-    re.compile(r"\b(?:sk|pk|rk|ghp|gho|github_pat|xox[abp])[-_][A-Za-z0-9_\-]{16,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
-]
-# A secret-looking name followed by "=" or ":". The keyword must be the whole name
-# or a separated part of it (OPENAI_API_KEY, apiKey), so "monkey" and "max_tokens" stay.
-SECRET_NAME = r"(?:[A-Za-z0-9]+[_-])*(?:api_?key|key|token|secret|password|passwd|pwd)(?:[_-][A-Za-z0-9]+)*"
-ASSIGNMENT_PATTERN = re.compile(rf"(?i)\b({SECRET_NAME})(\s*[=:：]\s*)[^\s,;]+")
-SPOKEN_PASSWORD = re.compile(r"(?i)\b(password|passwd)(\s+(?:is|=)\s+)\S+|(密碼)(\s*(?:是|為|:|：)\s*)\S+")
-URL_CREDENTIALS = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@", re.IGNORECASE)
-BEARER_TOKEN = re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 TOOL_INPUT_LIMIT = 300
 COMMAND_LIMIT = 600
+CODE_LIMIT = 1500
 TOOL_RESULT_LIMIT = 400
 ERROR_RESULT_LIMIT = 1200
-# Records Claude Code writes as "user" but that the person did not type as a message.
-COMMAND_TAGS = ("<command-name>", "<command-message>", "<local-command-stdout>", "<local-command-stderr>")
-
-
-def redact(text):
-    for pattern in TOKEN_PATTERNS:
-        text = pattern.sub("<redacted>", text)
-    text = URL_CREDENTIALS.sub(lambda m: m.group(1) + "<redacted>@", text)
-    text = BEARER_TOKEN.sub(lambda m: m.group(1) + "<redacted>", text)
-    text = SPOKEN_PASSWORD.sub(lambda m: (m.group(1) or m.group(3)) + (m.group(2) or m.group(4)) + "<redacted>", text)
-    return ASSIGNMENT_PATTERN.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text)
+# Claude Code's message when the person rejects a tool call and types a reason. Both parts
+# must match, so an ordinary error that happens to contain "the user said:" stays an error.
+REJECTION_REASON = re.compile(r"doesn't want to proceed with this tool use.*?the user said:\s*(.+)",
+                              re.IGNORECASE | re.DOTALL)
 
 
 def clip(text, limit):
@@ -101,188 +87,170 @@ def clip(text, limit):
     return text[:limit] + f" …〔已截斷，原長 {len(text)} 字〕"
 
 
-def session_cwd(path, max_lines=200):
-    """Return the working directory recorded near the start of a session log."""
-    with path.open(encoding="utf-8") as handle:
-        for index, line in enumerate(handle):
-            if index >= max_lines:
-                break
-            try:
-                cwd = json.loads(line).get("cwd")
-            except json.JSONDecodeError:
-                continue
-            if cwd:
-                return cwd
-    return None
+def clip_end(text, limit):
+    """Keep the end of a long output, where test runners print their verdict."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return f"〔前面 {len(text) - limit} 字已省略〕… " + text[-limit:]
 
 
-def current_session(cwd):
-    """Most recently modified session whose recorded working directory is cwd.
+def safe(text, limit, keep_end=False):
+    """Mask secrets first, then shorten, so a cut can never leave half a secret unmasked."""
+    masked = redact(str(text))
+    return clip_end(masked, limit) if keep_end else clip(masked, limit)
 
-    Claude Code names project folders by replacing every non-alphanumeric
-    character of the path with "-", so the folder name cannot be rebuilt
-    reliably (underscores, dots, spaces, non-ASCII). Match on the recorded cwd.
+
+def current_session(cwd, source):
+    """The session this command is running inside.
+
+    Claude Code tells its child processes the session ID (CLAUDE_CODE_SESSION_ID),
+    so that log is used directly. Without it, sessions are matched on their
+    recorded working directory (folder names are rewritten paths and cannot be
+    rebuilt reliably). If more than one matches, ask instead of guessing: another
+    window in the same folder may have been updated more recently.
     """
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if source == "claude" and session:
+        # The ID is known, so only that log will do; never fall back to another session.
+        matches = [path for _, path in src.find_by_id(session, ["claude"]) if path.stem == session]
+        if len(matches) == 1:
+            return source, matches[0]
+        sys.exit(f"Claude Code 說目前的對話是 {session}，但找不到唯一的那份紀錄（找到 {len(matches)} 份）。"
+                 "紀錄可能還沒寫入；請稍後再試，或改給 session ID。")
     target = str(Path(cwd).expanduser().resolve())
-    logs = sorted(PROJECTS.glob("*/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for path in logs:
-        recorded = session_cwd(path)
+    found = []
+    for path in src.all_logs(source):
+        if source == "codex" and src.is_codex_subagent(path):
+            continue
+        recorded = src.log_cwd(path)
         if recorded and str(Path(recorded).resolve()) == target:
-            return path
-    sys.exit(f"找不到工作目錄是 {target} 的 session。請改給 session ID，或先用 list 查。")
+            found.append(path)
+    if len(found) == 1:
+        return source, found[0]
+    if not found:
+        sys.exit(f"找不到工作目錄是 {target} 的 {src.TOOL_NAMES[source]} session。請改給 session ID，或先用 list 查。")
+    found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    rows = "\n".join(f"  - {src.session_id(p, source)}（最後更新 {datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M}）"
+                     for p in found[:10])
+    sys.exit(f"這個資料夾有 {len(found)} 個 {src.TOOL_NAMES[source]} session，無法確定是哪一個，"
+             f"請指定 session ID：\n{rows}")
 
 
-def resolve_session(target, cwd=None):
+def resolve_session(target, cwd=None, source="auto"):
+    """(source, path) for a session ID prefix, a .jsonl path, or "current"."""
     if target == "current":
-        return current_session(cwd or Path.cwd())
+        return current_session(cwd or Path.cwd(), "claude" if source == "auto" else source)
     path = Path(target).expanduser()
     if path.suffix == ".jsonl" and path.is_file():
-        return path
-    matches = sorted(PROJECTS.glob(f"*/{target}*.jsonl"))
+        return (src.detect_source(path) if source == "auto" else source), path
+    matches = src.find_by_id(target, src.SOURCES if source == "auto" else [source])
     if len(matches) == 1:
         return matches[0]
     if not matches:
-        sys.exit(f"找不到 session：{target}（在 {PROJECTS} 底下沒有符合的 .jsonl）")
-    sys.exit("有多個 session 符合，請給更完整的 ID：" + ", ".join(m.stem for m in matches))
-
-
-def read_records(path):
-    records = []
-    with path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as error:
-                print(f"警告：第 {line_number} 行不是合法 JSON，已略過（{error}）", file=sys.stderr)
-    return records
-
-
-def block_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(item.get("text", ""))
-            elif isinstance(item, dict) and item.get("type") == "image":
-                parts.append("〔圖片〕")
-        return "\n".join(parts)
-    return ""
-
-
-def slash_command(record):
-    """Return the slash command text (e.g. "/login") or its output, else None."""
-    if record.get("type") != "user" or record.get("isMeta"):
-        return None
-    content = block_text((record.get("message") or {}).get("content")).strip()
-    if not content.startswith(COMMAND_TAGS):
-        return None
-    name = re.search(r"<command-name>(.*?)</command-name>", content, re.DOTALL)
-    args = re.search(r"<command-args>(.*?)</command-args>", content, re.DOTALL)
-    if name:
-        return f"{name.group(1).strip()} {args.group(1).strip() if args else ''}".strip()
-    output = re.sub(r"</?local-command-std(?:out|err)>", "", content).strip()
-    return f"（指令輸出）{output}"
-
-
-def has_typed_request(record):
-    """True when a slash command carries text the person typed after it."""
-    content = block_text((record.get("message") or {}).get("content"))
-    args = re.search(r"<command-args>(.*?)</command-args>", content, re.DOTALL)
-    return bool(args and args.group(1).strip())
-
-
-def user_text(record):
-    """What the person typed: plain message text, or "/command request"."""
-    note = slash_command(record)
-    return note if note is not None else block_text(record["message"].get("content"))
-
-
-def is_typed_user(record):
-    if record.get("type") != "user" or record.get("isMeta") or record.get("isCompactSummary"):
-        return False
-    content = (record.get("message") or {}).get("content")
-    if isinstance(content, list) and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in content):
-        return False
-    if slash_command(record) is not None and not has_typed_request(record):
-        return False
-    origin = record.get("origin") or {}
-    return origin.get("kind", "human") == "human"
-
-
-def instruction_paths(record):
-    """Paths of instruction files (CLAUDE.md, rules, memory) recorded as loaded."""
-    attachment = record.get("attachment") or {}
-    if attachment.get("type") == "instructions":
-        return [f.get("path") for f in attachment.get("files") or [] if isinstance(f, dict) and f.get("path")]
-    if attachment.get("type") == "nested_memory" and attachment.get("path"):
-        return [attachment["path"]]
-    return []
+        sys.exit(f"找不到 session：{target}（查過 Claude Code、Codex、OMP 的紀錄資料夾）")
+    sys.exit("有多個 session 符合，請給更完整的 ID 或加 --source：" +
+             ", ".join(f"{src.TOOL_NAMES[s]} {src.session_id(p, s)}" for s, p in matches))
 
 
 def tool_brief(payload):
-    """One-line view of a tool call; shell commands are shown verbatim."""
+    """One-line view of a tool call; shell commands and scripts are shown verbatim (masked)."""
     command = payload.get("command")
     if command:
-        brief = f"`{clip(redact(str(command)), COMMAND_LIMIT)}`"
+        brief = f"`{safe(command, COMMAND_LIMIT)}`"
         if payload.get("description"):
-            brief += f"（{clip(str(payload['description']), 80)}）"
+            brief += f"（{safe(payload['description'], 80)}）"
         return brief
-    detail = payload.get("file_path") or payload.get("description") or payload.get("prompt") or json.dumps(payload, ensure_ascii=False)
-    return clip(redact(str(detail)), TOOL_INPUT_LIMIT)
+    if payload.get("session_id") is not None and "chars" in payload:
+        earlier = f"先前的指令 `{safe(payload['continues'], COMMAND_LIMIT)}`" if payload.get("continues") else "先前的指令"
+        if payload["chars"].strip():
+            return f"送入文字 `{safe(payload['chars'], COMMAND_LIMIT)}` 給{earlier}"
+        return f"等待{earlier}"
+    if payload.get("continues"):
+        return f"等待先前的指令：`{safe(payload['continues'], COMMAND_LIMIT)}`"
+    if payload.get("code"):
+        return f"{safe(payload.get('description') or '程式內容', 200)}\n\n```\n{safe(payload['code'], CODE_LIMIT)}\n```"
+    detail = (payload.get("file_path") or payload.get("path") or payload.get("description")
+              or payload.get("prompt") or json.dumps(payload, ensure_ascii=False))
+    return safe(detail, TOOL_INPUT_LIMIT)
 
 
-def summarize_session(path):
-    records = read_records(path)
-    first_user = next((r for r in records if is_typed_user(r)), None)
-    typed = [r for r in records if is_typed_user(r)]
-    title = next((r.get("aiTitle") for r in reversed(records) if r.get("type") == "ai-title"), "")
+def summarize_session(path, source=None):
+    log = src.read_session(path, source)
+    typed = [e for e in log.events if e.kind == "user"]
     return {
-        "id": path.stem,
-        "project": path.parent.name,
+        "source": log.source,
+        "id": log.id,
+        "project": redact(src.project_label(path, log.source)),
+        "started": fmt_day(log.first_timestamp()),
         "modified": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
         "size_mb": path.stat().st_size / 1_000_000,
         "user_turns": len(typed),
         # Same rule as the digest: the opening message is never counted as a correction.
-        "hint_turns": sum(1 for r in typed[1:] if CORRECTION_HINTS.search(user_text(r))),
-        "title": title or clip(user_text(first_user) if first_user else "", 60),
+        "hint_turns": sum(1 for e in typed[1:] if CORRECTION_HINTS.search(e.text)),
+        "title": safe(log.title or (typed[0].text if typed else ""), 60).replace("\n", " ").replace("|", "／"),
     }
 
 
-def project_dirs(keyword):
-    if not keyword:
-        return sorted(PROJECTS.iterdir())
-    path = Path(keyword).expanduser()
-    if path.is_dir():
-        return [path]
-    matches = [d for d in PROJECTS.iterdir() if d.is_dir() and keyword.lower() in d.name.lower()]
-    if not matches:
-        sys.exit(f"找不到名稱含「{keyword}」的專案資料夾（在 {PROJECTS} 底下）")
-    return sorted(matches)
+def project_matches(keyword, label):
+    """Keyword match that ignores how each tool rewrites paths (Claude Code turns "_" and "/" into "-").
+
+    Only separators are loosened; letters in any language are kept, so a Chinese
+    keyword is never reduced to "-" and matched against every path.
+    """
+    keyword, label = keyword.lower(), label.lower()
+    if keyword in label:
+        return True
+    loose = lambda text: re.sub(r"[\W_]+", "-", text).strip("-")
+    pattern = loose(keyword)
+    return bool(pattern) and pattern in loose(label)
 
 
-def first_timestamp(path):
-    for record in read_records(path):
-        if record.get("timestamp"):
-            return record["timestamp"]
-    return ""
+def candidate_logs(source, keyword):
+    """(source, path) of top-level logs, optionally only those whose project matches keyword."""
+    sources = src.SOURCES if source == "all" else [source]
+    folder = Path(keyword).expanduser() if keyword else None
+    found = []
+    for name in sources:
+        for path in src.all_logs(name):
+            if folder and folder.is_dir():
+                if path.parent.resolve() != folder.resolve():
+                    continue
+            elif keyword and not project_matches(keyword, src.project_label(path, name)):
+                continue
+            found.append((name, path))
+    if keyword and not found:
+        sys.exit(f"找不到專案名稱或資料夾含「{keyword}」的 session。"
+                 "Claude Code 的專案資料夾名稱裡只留英文和數字，中文關鍵字比對不到；請改用路徑裡的英文部分，或直接給資料夾路徑。")
+    return sorted(found, key=lambda item: item[1].stat().st_mtime, reverse=True)
 
 
 def cmd_list(args):
-    files = [f for d in project_dirs(args.project) for f in d.glob("*.jsonl")]
-    files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[: args.limit]
-    if not files:
+    rows = []
+    for name, path in candidate_logs(args.source, args.project):
+        if len(rows) >= args.limit:
+            break
+        if name == "codex" and src.is_codex_subagent(path):
+            continue  # helper agents Codex spawned; they appear under their parent's digest
+        rows.append(summarize_session(path, name))
+    if not rows:
         sys.exit("找不到任何 session 紀錄")
-    print("| 開始 | 最後更新 | 專案 | Session ID | 大小 | 使用者發言 | 疑似糾正 | 標題 |")
-    print("|---|---|---|---|---|---|---|---|")
-    for path in files:
-        s = summarize_session(path)
-        started = fmt_day(first_timestamp(path))
-        print(f"| {started} | {s['modified']} | {s['project']} | {s['id']} | {s['size_mb']:.1f} MB | {s['user_turns']} | {s['hint_turns']} | {s['title']} |")
+    print("| 工具 | 開始 | 最後更新 | 專案 | Session ID | 大小 | 使用者發言 | 疑似糾正 | 標題 |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for s in rows:
+        print(f"| {src.TOOL_NAMES[s['source']]} | {s['started']} | {s['modified']} | {s['project']} | {s['id']} | "
+              f"{s['size_mb']:.1f} MB | {s['user_turns']} | {s['hint_turns']} | {s['title']} |")
+
+
+def parse_time(stamp):
+    """Aware datetime for an ISO timestamp, or for "YYYY-MM-DD HH:MM" in local time; None if unreadable."""
+    if not stamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.astimezone()
 
 
 def fmt_day(stamp):
@@ -294,120 +262,158 @@ def fmt_day(stamp):
         return stamp[:16]
 
 
-def digest_one(path, tag, keep_results):
-    records = read_records(path)
-    tool_names = {}
+def result_line(event, command, keep_results):
+    """How one successful or unknown result appears in the digest."""
+    text = redact(event.text)
+    if event.status == "running":
+        return f"  - ↳ 仍在執行，結果在後面（{event.name}）"
+    if event.status == "unknown":
+        return f"  - ❔ 結束狀態不明（{event.name}）：{clip_end(text, TOOL_RESULT_LIMIT)}"
+    if keep_results:
+        return f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}"
+    if CHECK_COMMAND.search(command):
+        return f"  - ↳ 檢查結果（結尾）：{clip_end(text, TOOL_RESULT_LIMIT)}"
+    return f"  - ↳ 成功，輸出未列出（{event.length or len(event.text)} 字）"
+
+
+def within(event, since):
+    """The part of an event at or after `since`, or None.
+
+    Folded retries keep every time they happened, so the copies after the cutoff
+    survive with their own count and the time of the first one kept.
+    """
+    times = event.times or (event.when,)
+    kept = [t for t in times if (parse_time(t) or since) >= since and parse_time(t) is not None]
+    if not kept:
+        return None
+    if len(kept) == len(times):
+        return event
+    return replace(event, when=kept[0], repeat=len(kept), times=tuple(kept))
+
+
+def digest_one(log, tag, keep_results, since=None):
     lines, signals = [], []
-    meta = {"cwd": None, "version": None, "permission": set(), "instructions": [], "models": set()}
     turn = 0
-    errors = swallows = loose_swallows = 0
+    errors = swallows = loose_swallows = rejections = skipped = 0
+    agent = log.agent
+    commands = {}  # call id -> shell command, to judge its result
 
-    for record in records:
-        kind = record.get("type")
-        meta["cwd"] = meta["cwd"] or record.get("cwd")
-        meta["version"] = meta["version"] or record.get("version")
-        if kind == "permission-mode":
-            meta["permission"].add(record.get("permissionMode"))
-        for loaded in instruction_paths(record):
-            if loaded not in meta["instructions"]:
-                meta["instructions"].append(loaded)
-        when = fmt_day(record.get("timestamp")) if record.get("timestamp") else "--"
-        message = record.get("message") or {}
-
-        command_note = slash_command(record)
-        if command_note is not None and not is_typed_user(record):
-            lines.append(f"- ⌨ 使用者執行斜線指令：{clip(redact(command_note), TOOL_INPUT_LIMIT)}")
-            continue
-        if kind == "user" and record.get("isCompactSummary"):
+    for event in log.events:
+        if event.kind == "user":
+            turn += 1  # counted even when hidden by --since, so turn numbers match the full digest
+        if event.kind == "tool" and event.call_id:
+            commands[event.call_id] = str(event.payload.get("command") or event.payload.get("continues")
+                                          or event.payload.get("code") or "")
+        if since:
+            event = within(event, since)
+            if event is None:
+                skipped += 1
+                continue
+        when = fmt_day(event.when) if event.when else "--"
+        if event.kind == "note":
+            lines.append(f"- ⌨ {clip(redact(event.text), TOOL_INPUT_LIMIT)}")
+        elif event.kind == "compact":
             lines.append(f"\n> 〔{when} 對話在這裡被壓縮（compact），之前的內容由系統摘要取代〕\n")
-            continue
-
-        if is_typed_user(record):
-            turn += 1
-            text = redact(user_text(record))
-            flag = ""
-            if CORRECTION_HINTS.search(text) and turn > 1:
-                flag = " ⚑疑似糾正"
+        elif event.kind == "interrupt":
+            signals.append(f"- {tag}{when} 使用者中斷了 {agent}" + (f"（{safe(event.text, 150)}）" if event.text else ""))
+            lines.append(f"- ⏹ 使用者在這裡中斷了 {agent}")
+        elif event.kind == "api_error":
+            times = f"（連續 {event.repeat} 次）" if event.repeat > 1 else ""
+            signals.append(f"- {tag}{when} 模型或連線錯誤{times}：{clip(redact(event.text), 150)}")
+            lines.append(f"  - ❌ 模型或連線錯誤{times}：{clip(redact(event.text), ERROR_RESULT_LIMIT)}")
+        elif event.kind == "user":
+            text = redact(event.text)
+            flag = " ⚑疑似糾正" if CORRECTION_HINTS.search(text) and turn > 1 else ""
+            if flag:
                 signals.append(f"- {tag}使用者第 {turn} 輪（{when}）疑似糾正：{clip(text, 120)}")
             if "[Request interrupted" in text:
-                signals.append(f"- {tag}使用者第 {turn} 輪（{when}）中斷了 Claude")
-            lines.append(f"\n## 【{tag}使用者 #{turn}】{when}{flag}\n\n{text.strip()}\n")
-            continue
-
-        if kind == "assistant":
-            meta["models"].add(message.get("model"))
-            for block in message.get("content") or []:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "text" and block.get("text", "").strip():
-                    lines.append(f"\n**【Claude】{when}**\n\n{redact(block['text']).strip()}\n")
-                elif block.get("type") == "tool_use":
-                    name = block.get("name", "?")
-                    tool_names[block.get("id")] = name
-                    payload = block.get("input") or {}
-                    lines.append(f"- 🔧 {name}：{tool_brief(payload)}")
-                    command = str(payload.get("command") or "")
-                    if ERROR_SWALLOW_HINTS.search(command):
-                        loose_swallows += 1
-                    risky = risky_swallow(command)
-                    if risky:
-                        swallows += 1
-                        found = "、".join(risky)
-                        signals.append(f"- {tag}{when} {name} ⚠ 檢查結果可能被吞掉（{found}）：{clip(redact(command), 150)}")
-                        lines.append(f"  - ⚠ 檢查結果可能被吞掉：{found}")
-            continue
-
-        if kind == "user":
-            for block in message.get("content") or []:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    continue
-                name = tool_names.get(block.get("tool_use_id"), "?")
-                text = redact(block_text(block.get("content")))
-                if block.get("is_error"):
-                    denied = "denied" in text.lower() or "rejected" in text.lower() or "拒絕" in text
-                    label = "⛔ 被拒絕" if denied else "❌ 錯誤"
-                    errors += 1
-                    signals.append(f"- {tag}{when} {name} {label}：{clip(text, 150)}")
-                    lines.append(f"  - {label}（{name}）：{clip(text, ERROR_RESULT_LIMIT)}")
-                elif keep_results:
-                    lines.append(f"  - ↳ {clip(text, TOOL_RESULT_LIMIT)}")
+                signals.append(f"- {tag}使用者第 {turn} 輪（{when}）中斷了 {agent}")
+            steering = "（在代理還在工作時插話）" if event.steering else ""
+            if event.repeat > 1:
+                steering += f"（同一句話連送 {event.repeat} 次，中間只有錯誤，多半是自動重試）"
+            lines.append(f"\n## 【{tag}使用者 #{turn}】{when}{steering}{flag}\n\n{text.strip()}\n")
+        elif event.kind == "assistant":
+            lines.append(f"\n**【{agent}】{when}**\n\n{redact(event.text).strip()}\n")
+        elif event.kind == "tool":
+            lines.append(f"- 🔧 {event.name}：{tool_brief(event.payload)}")
+            command = str(event.payload.get("command") or "")
+            if ERROR_SWALLOW_HINTS.search(command):
+                loose_swallows += 1
+            risky = risky_swallow(command)
+            if risky:
+                swallows += 1
+                found = "、".join(risky)
+                signals.append(f"- {tag}{when} {event.name} ⚠ 檢查結果可能被吞掉（{found}）：{clip(redact(command), 150)}")
+                lines.append(f"  - ⚠ 檢查結果可能被吞掉：{found}")
+        elif event.kind == "result":
+            text = redact(event.text)
+            if event.status != "error":
+                lines.append(result_line(event, commands.get(event.call_id, ""), keep_results))
+                continue
+            errors += 1
+            reason = REJECTION_REASON.search(text)
+            lowered = text.lower()
+            if reason and reason.group(1).strip():
+                # The person stopped this action and said why: a direct correction.
+                rejections += 1
+                said = reason.group(1).strip()
+                signals.append(f"- {tag}{when} {event.name} ⛔ 使用者拒絕並說明：{clip(said, 200)}")
+                lines.append(f"  - ⛔ 使用者拒絕並說明（{event.name}）：{clip(said, ERROR_RESULT_LIMIT)}")
+                continue
+            denied = "denied" in lowered or "rejected" in lowered or "拒絕" in text
+            label = "⛔ 被拒絕" if denied else "❌ 錯誤"
+            signals.append(f"- {tag}{when} {event.name} {label}：{clip(text, 150)}")
+            lines.append(f"  - {label}（{event.name}）：{clip(text, ERROR_RESULT_LIMIT)}")
 
     header = [
-        f"## {tag}Session {path.stem}",
+        f"## {tag}Session {redact(log.id)}",
         "",
-        f"- 紀錄檔：`{path}`",
-        f"- 工作目錄：`{meta['cwd']}`",
-        f"- Claude Code 版本：{meta['version']}；模型：{', '.join(sorted(m for m in meta['models'] if m))}",
-        f"- 權限模式：{', '.join(sorted(p for p in meta['permission'] if p)) or '未記錄'}",
-        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次；檢查結果可能被吞掉的指令 {swallows} 次",
+        f"- 紀錄檔：`{redact(str(log.path))}`",
+        f"- 工作目錄：`{redact(str(log.cwd))}`",
+        f"- 工具：{log.tool}，版本 {redact(str(log.version))}；模型：{redact(', '.join(sorted(str(m) for m in log.models if m)))}",
+        f"- 權限模式：{redact(', '.join(sorted(str(p) for p in log.permission if p))) or '未記錄'}",
+        f"- 使用者發言 {turn} 輪；工具錯誤／拒絕 {errors} 次（其中使用者拒絕並說明理由 {rejections} 次）；檢查結果可能被吞掉的指令 {swallows} 次",
         f"- 另有 {loose_swallows} 個指令用了 `| head`、`2>/dev/null` 等寫法，多半只是縮短輸出，未逐一列出；診斷時可視需要 grep 原始紀錄",
     ]
-    if meta["instructions"]:
+    if since:
+        header.append(f"- 只看 {since.astimezone():%Y-%m-%d %H:%M} 之後：之前的 {skipped} 則事件已省略，輪次編號仍與完整摘要相同")
+        lines.insert(0, f"\n> 〔{since.astimezone():%Y-%m-%d %H:%M} 之前的 {skipped} 則事件已省略〕\n")
+    if log.instructions:
         header.append("- 載入的指示檔（依紀錄，出現順序）：")
-        header += [f"  - `{item}`" for item in meta["instructions"]]
+        header += [f"  - `{redact(item)}`" for item in log.instructions]
     else:
-        header.append("- 載入的指示檔：紀錄裡找不到（可能是 Claude Code 紀錄格式變了），請改從工作目錄與 `~/.claude/` 推斷")
-    subagent_logs = sorted((path.parent / path.stem / "subagents").glob("*.jsonl"))
-    if subagent_logs:
-        header.append(f"- 另有 {len(subagent_logs)} 份 subagent 紀錄（可用同一支腳本另做摘要）：")
-        header += [f"  - `{log}`" for log in subagent_logs]
+        header.append(f"- 載入的指示檔：{log.missing_instructions}")
+    if log.injected_rules:
+        header.append("- 臨時套用的規則（工具在對話中途注入的規則名稱，不是檔案路徑）：" + redact("、".join(log.injected_rules)))
+    if log.subagent_logs:
+        header.append(f"- 另有 {len(log.subagent_logs)} 份 subagent 紀錄（可用同一支腳本另做摘要）：")
+        header += [f"  - `{redact(str(sub))}`" for sub in log.subagent_logs]
+    if log.source == "codex":
+        header.append("- Codex 的小助手紀錄只在同一天的資料夾裡找；跨過午夜才開始的小助手不會列出")
     return header, lines, signals, turn
 
 
 def cmd_digest(args):
-    paths = list(dict.fromkeys(resolve_session(t, args.cwd) for t in args.targets))
-    paths.sort(key=first_timestamp)
-    multi = len(paths) > 1
-    headers, bodies, all_signals, total_turns = [], [], [], 0
-    for index, path in enumerate(paths, 1):
+    since = parse_time(args.since) if args.since else None
+    if args.since and since is None:
+        sys.exit(f"看不懂 --since 的時間：{args.since}（請用 2026-10-13 14:30 這種格式，代表本機時間）")
+    targets = list(dict.fromkeys(resolve_session(t, args.cwd, args.source) for t in args.targets))
+    # Order by the first timestamp, read from the head of each file; then read one log at a time.
+    targets.sort(key=lambda item: src.first_timestamp(item[1]))
+    multi = len(targets) > 1
+    headers, bodies, all_signals, total_turns, title_ids = [], [], [], 0, []
+    for index, (source, path) in enumerate(targets, 1):
+        log = src.read_session(path, source)
         tag = f"S{index} " if multi else ""
-        header, lines, signals, turns = digest_one(path, tag, args.results)
+        header, lines, signals, turns = digest_one(log, tag, args.results, since)
         headers += header + [""]
-        bodies += [f"\n# {tag}時序：{path.stem}（開始於 {fmt_day(first_timestamp(path))}）"] + lines
+        bodies += [f"\n# {tag}時序：{log.tool} {redact(log.id)}（開始於 {fmt_day(log.first_timestamp())}）"] + lines
         all_signals += signals
         total_turns += turns
+        title_ids.append(f"{log.tool} {redact(log.id)}")
+        del log
 
-    title = f"# 對話摘要：{len(paths)} 個 session（依開始時間排序）" if multi else f"# Session 摘要：{paths[0].stem}"
+    title = f"# 對話摘要：{len(targets)} 個 session（依開始時間排序）" if multi else f"# Session 摘要：{title_ids[0]}"
     doc = [title, ""]
     if multi:
         doc += ["同一件工作被重開成多個 session，依時間串起來讀。編號 S1、S2… 對應下方各段。", ""]
@@ -418,24 +424,33 @@ def cmd_digest(args):
 
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Every field was masked on its own above; masking the joined document would let a
+    # multi-line pattern (a private key) run across messages and erase what lies between.
     out.write_text("\n".join(doc) + "\n", encoding="utf-8")
     size_kb = out.stat().st_size / 1000
-    print(f"已寫入 {out}（{size_kb:.0f} KB，{len(paths)} 個 session，使用者 {total_turns} 輪，訊號 {len(all_signals)} 則）")
+    print(f"已寫入 {out}（{size_kb:.0f} KB，{len(targets)} 個 session，使用者 {total_turns} 輪，訊號 {len(all_signals)} 則）")
     if size_kb > LARGE_DIGEST_KB:
-        print(f"注意：摘要超過 {LARGE_DIGEST_KB} KB，完整讀完會用掉較多額度與時間。", file=sys.stderr)
+        print(f"注意：摘要超過 {LARGE_DIGEST_KB} KB，完整讀完會用掉較多額度與時間。"
+              "可以加 --since \"YYYY-MM-DD HH:MM\" 只看某個時間之後。", file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     p_list = sub.add_parser("list", help="列出最近的 session")
-    p_list.add_argument("--project", help="只看專案名稱含這個關鍵字的資料夾（例如 my-app），或直接給資料夾路徑")
+    p_list.add_argument("--source", choices=("all",) + src.SOURCES, default="all",
+                        help="只看某個工具的紀錄：claude（Claude Code）、codex（Codex CLI）、omp（預設全部）")
+    p_list.add_argument("--project", help="只看專案名稱或工作目錄含這個關鍵字的 session（例如 my-app），或直接給紀錄資料夾路徑")
     p_list.add_argument("--limit", type=int, default=15)
     p_digest = sub.add_parser("digest", help="把一個或多個 session 壓成一份摘要")
-    p_digest.add_argument("targets", nargs="+", help="session ID（可只給前幾碼）、.jsonl 路徑，或 current；可給多個")
+    p_digest.add_argument("targets", nargs="+", help="session ID（可只給前幾碼）、.jsonl 路徑，或 current；可給多個，可混用不同工具")
     p_digest.add_argument("--out", required=True, help="摘要輸出路徑")
-    p_digest.add_argument("--results", action="store_true", help="也保留成功的工具結果（摘要會變大）")
+    p_digest.add_argument("--results", action="store_true",
+                          help="保留所有成功工具結果的開頭（預設只保留測試、建置等檢查指令結果的結尾）")
+    p_digest.add_argument("--since", help="只看這個時間之後，例如 \"2026-10-13 14:30\"（本機時間）或 ISO 時間；輪次編號不變")
     p_digest.add_argument("--cwd", help="搭配 current 使用：指定工作目錄（預設為目前所在資料夾）")
+    p_digest.add_argument("--source", choices=("auto",) + src.SOURCES, default="auto",
+                          help="紀錄來自哪個工具；auto 會從檔案內容判斷、ID 會在三個工具的資料夾都找。current 搭配 auto 時視為 Claude Code")
     args = parser.parse_args()
     {"list": cmd_list, "digest": cmd_digest}[args.command](args)
 
